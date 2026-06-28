@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  redis:
+    container_name: tracking-redis
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    # Appendonly disabled for pure speed; we don't need permanent persistence for 15s tracks
+    command: redis-server --maxmemory 4gb --maxmemory-policy allkeys-lru

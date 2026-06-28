@@ -1,0 +1,11 @@
+ultralytics==8.2.0
+opencv-python-headless==4.9.0.80
+opencv-python==4.9.0.80
+numpy>=1.24.0
+scipy>=1.10.0
+redis==5.0.3
+faiss-cpu==1.8.0
+
+# NOTE: You MUST install torchreid manually for OSNet:
+# git clone [https://github.com/KaiyangZhou/deep-person-reid.git](https://github.com/KaiyangZhou/deep-person-reid.git)
+# cd deep-person-reid && python setup.py install

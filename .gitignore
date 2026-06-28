@@ -1,0 +1,5 @@
+videos/
+.venv/
+*.pt
+__pycache__/
+*.npy

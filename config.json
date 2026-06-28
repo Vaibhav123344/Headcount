@@ -1,0 +1,16 @@
+{
+  "cameras": {
+    "cam_00": {
+      "video_path": "videos/cam_00.mp4",
+      "matrix_path": "calibration/cam_00_matrix.npy"
+    },
+    "cam_01": {
+      "video_path": "videos/cam_01.mp4",
+      "matrix_path": "calibration/cam_01_matrix.npy"
+    },
+    "cam_02": {
+      "video_path": "videos/cam_02.mp4",
+      "matrix_path": "calibration/cam_02_matrix.npy"
+    }
+  }
+}
