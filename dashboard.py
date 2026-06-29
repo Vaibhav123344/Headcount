@@ -30,7 +30,7 @@ while True:
         frame_bytes = r.get(f"frame:{cam_id}")
         if frame_bytes:
             # frame_bytes is a JPEG encoded string from OpenCV
-            img_placeholders[cam_id].image(frame_bytes, caption=cam_id, use_container_width=True)
+            img_placeholders[cam_id].image(frame_bytes, caption=cam_id, width="stretch")
         else:
             img_placeholders[cam_id].info(f"Waiting for {cam_id} stream...")
 
@@ -44,7 +44,7 @@ while True:
             c2.metric("Next ID to Assign", state.get("next_id", 1))
             
             if state.get("entries"):
-                st.dataframe(state["entries"], use_container_width=True)
+                st.dataframe(state["entries"], width="stretch")
             else:
                 st.info("No active tracks.")
         else:

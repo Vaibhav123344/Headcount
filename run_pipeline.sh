@@ -7,13 +7,13 @@ python workers/init_db.py
 echo "Starting Global Matcher..."
 python workers/global_matcher.py &
 
-echo "Starting Re-ID Feature Extractor..."
-python workers/reid_worker.py &
 
 echo "Starting Single Camera Trackers (Pose + Homography)..."
-python workers/sct_worker.py --cam_id cam_00 --source videos/cam_00.mp4 --homography calibration/cam_00_matrix.npy &
-python workers/sct_worker.py --cam_id cam_01 --source videos/cam_01.mp4 --homography calibration/cam_01_matrix.npy &
-python workers/sct_worker.py --cam_id cam_02 --source videos/cam_02.mp4 --homography calibration/cam_02_matrix.npy &
+python workers/sct_worker.py --cam_id cam1 --source videos/cam2.mp4 --homography calibration/cam1_matrix.npy &
+python workers/sct_worker.py --cam_id cam2 --source videos/cam3.mp4 --homography calibration/cam2_matrix.npy &
+
+echo "Starting Streamlit Dashboard..."
+python -m streamlit run dashboard.py --server.headless true &
 
 echo "Pipeline is running. Press Ctrl+C to stop."
 wait

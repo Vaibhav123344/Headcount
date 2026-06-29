@@ -39,7 +39,7 @@ class ReIDWorker:
                 print("Attempting to load OSNet model via torchreid...")
                 extractor = FeatureExtractor(
                     model_name='osnet_x1_0',
-                    model_path='osnet_x1_0_imagenet.pth',
+                    model_path='osnet_x1_0_msmt17.pth',
                     device=str(self.device)
                 )
                 self.backend = "osnet"
@@ -68,7 +68,9 @@ class ReIDWorker:
             pil_imgs.append(Image.fromarray(img_rgb))
         
         if self.backend == "osnet" and self._osnet is not None:
-            feats = self._osnet(pil_imgs)
+            # torchreid FeatureExtractor expects numpy arrays (RGB) or file paths
+            np_imgs_rgb = [cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in imgs]
+            feats = self._osnet(np_imgs_rgb)
             if isinstance(feats, torch.Tensor):
                 feats = feats.cpu().numpy()
         else:

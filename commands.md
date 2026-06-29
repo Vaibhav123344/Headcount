@@ -1,45 +1,82 @@
-# Headcount Project Commands
+# Headcount Project Commands (Linux)
 
-Here is the complete step-by-step guide to setting up and running your pipeline on your new videos (`cam1.mp4` and `cam2.mp4`).
+Here is the complete step-by-step guide to calibrating the cameras and running your new Inline-ReID pipeline on Linux.
 
-Open your PowerShell terminal in the `C:\Users\HP\Documents\Projects\Headcount` directory and run the following:
+Open your terminal in the `Headcount` directory and run the following:
 
 ## Step 1: Extract Calibration Frames
-We need the first frame of each video to calibrate the 3D ground plane. I've created a helper script for this.
-```powershell
-call .venv\Scripts\activate.bat
-python tools\extract_frame.py --video videos\cam1.mp4 --output calibration\cam1_frame.jpg
-python tools\extract_frame.py --video videos\cam2.mp4 --output calibration\cam2_frame.jpg
+We need the first frame of each video to calibrate the 3D ground plane.
+
+```bash
+# Activate your virtual environment first!
+source .venv/bin/activate
+
+# Extract frame for Camera 1 (camera2_20260627_103326.mp4)
+python tools/extract_frame.py --video videos/camera2_20260627_103326.mp4 --output calibration/cam1_frame.jpg
+
+# Extract frame for Camera 2 (camera3_20260627_103325.mp4)
+python tools/extract_frame.py --video videos/camera3_20260627_103325.mp4 --output calibration/cam2_frame.jpg
 ```
 
 ## Step 2: Calibrate the Cameras (Homography)
 Run the calibration tool on the extracted frames. A window will pop up. 
 Click **exactly 4 points** on the ground that form a rectangle in the real world (e.g., corners of a pallet, tiles on the floor).
-Order matters: Top-Left, Top-Right, Bottom-Right, Bottom-Left.
+Order matters: **Top-Left, Top-Right, Bottom-Right, Bottom-Left**.
 
 **For Camera 1:**
-```powershell
-python tools\calibrate_camera.py --image calibration\cam1_frame.jpg --output calibration\cam1_matrix.npy
+```bash
+python tools/calibrate_camera.py --image calibration/cam1_frame.jpg --output calibration/cam1_matrix.npy
 ```
 *(Press any key when it shows the Top-Down preview to close and save it)*
 
 **For Camera 2:**
-```powershell
-python tools\calibrate_camera.py --image calibration\cam2_frame.jpg --output calibration\cam2_matrix.npy
+```bash
+python tools/calibrate_camera.py --image calibration/cam2_frame.jpg --output calibration/cam2_matrix.npy
 ```
 
 ## Step 3: Run the Pipeline!
-Everything is configured. `run_pipeline.bat` and `dashboard.py` have been automatically updated to read from your new `cam1.mp4` and `cam2.mp4` files.
+Everything is configured. `run_pipeline.sh` has been updated to use our new zero-latency architecture.
 
-```powershell
-.\run_pipeline.bat
+```bash
+# First, ensure you have a clean Redis state
+python -c "import redis; r = redis.Redis(); r.flushdb(); print('Redis flushed')"
+
+# Start the pipeline
+./run_pipeline.sh
 ```
 
 This will automatically:
-1. Start the Redis container
-2. Wipe any old tracking data
-3. Open the Batched Global Matcher
-4. Open the Re-ID Worker
-5. Open the Object Tracker for `cam1`
-6. Open the Object Tracker for `cam2`
-7. Launch the Streamlit Live Dashboard in your web browser!
+1. Initialize the Database mapping structures
+2. Start the Global Matcher
+3. Start the Object Tracker with Inline-ReID for `cam1`
+4. Start the Object Tracker with Inline-ReID for `cam2`
+5. Launch the Streamlit Live Dashboard in your web browser!
+
+
+
+
+
+
+
+
+
+
+
+Quick Summary of the Commands
+1. Extract a single frame for calibration:
+
+bash
+source .venv/bin/activate
+python tools/extract_frame.py --video videos/cam2.mp4 --output calibration/cam1_frame.jpg
+python tools/extract_frame.py --video videos/cam3.mp4 --output calibration/cam2_frame.jpg
+2. Perform the Dual-Window Floor Plan Calibration:
+
+```bash
+python tools/calibrate_with_floorplan.py --image calibration/cam1_frame.jpg --floor-plan map.png --output calibration/cam1_matrix.npy
+python tools/calibrate_with_floorplan.py --image calibration/cam2_frame.jpg --floor-plan map.png --output calibration/cam2_matrix.npy
+```
+3. Run the optimized pipeline:
+
+bash
+python -c "import redis; r = redis.Redis(); r.flushdb(); print('Redis flushed')"
+./run_pipeline.sh

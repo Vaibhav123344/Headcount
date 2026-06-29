@@ -1,0 +1,16 @@
+Collecting scikit-learn
+  Downloading scikit_learn-1.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (11 kB)
+Requirement already satisfied: numpy>=1.24.1 in ./.venv/lib/python3.12/site-packages (from scikit-learn) (1.26.4)
+Requirement already satisfied: scipy>=1.10.0 in ./.venv/lib/python3.12/site-packages (from scikit-learn) (1.13.1)
+Collecting joblib>=1.4.0 (from scikit-learn)
+  Downloading joblib-1.5.3-py3-none-any.whl.metadata (5.5 kB)
+Requirement already satisfied: narwhals>=2.0.1 in ./.venv/lib/python3.12/site-packages (from scikit-learn) (2.22.1)
+Collecting threadpoolctl>=3.5.0 (from scikit-learn)
+  Downloading threadpoolctl-3.6.0-py3-none-any.whl.metadata (13 kB)
+Downloading scikit_learn-1.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (9.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 9.1/9.1 MB 2.7 MB/s  0:00:03
+Downloading joblib-1.5.3-py3-none-any.whl (309 kB)
+Downloading threadpoolctl-3.6.0-py3-none-any.whl (18 kB)
+Installing collected packages: threadpoolctl, joblib, scikit-learn
+
+Successfully installed joblib-1.5.3 scikit-learn-1.9.0 threadpoolctl-3.6.0
