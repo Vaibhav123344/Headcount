@@ -1,551 +1,299 @@
 import redis
 import json
+import msgpack # ── Upgrade 4: Binary Serialization
 import numpy as np
 import time
 import math
 import logging
 from scipy.optimize import linear_sum_assignment
-from sklearn.cluster import DBSCAN
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("global_matcher")
 
+def load_config():
+    with open("config.json") as f:
+        return json.load(f)
+
 class GalleryEntry:
-    """Represents a single globally-tracked person in the gallery."""
-    def __init__(self, global_id, embedding, last_seen, last_x, last_y, cam_id,
-                 velocity_x=0.0, velocity_y=0.0):
+    # --- FIX 1: Add local_id to arguments ---
+    def __init__(self, global_id, local_id, embedding, last_seen, last_x, last_y, cam_id, velocity_x=0.0, velocity_y=0.0):
         self.global_id  = global_id
-        self.feature_bank = [embedding]  # Store up to 5 high-quality embeddings
+        self.feature_bank = [embedding] 
         self.last_seen   = last_seen
         self.last_x      = last_x
         self.last_y      = last_y
         self.velocity_x  = velocity_x
         self.velocity_y  = velocity_y
         self.cam_history = {cam_id}
+        
+        # --- FIX 1 (cont): Save actual local_id ---
+        self.active_local_ids = {cam_id: int(local_id)} 
+        self.last_cam_update = {cam_id: last_seen}
 
 class GlobalMatcher:
-    """
-    Multi-stage global matcher with:
-      - Stage 0: Identity lock (pre-matched tracks bypass matching)
-      - Stage 1: High-confidence Hungarian (visual + spatial, relaxed for cross-cam)
-      - Stage 2: DBSCAN spatial-density backup (relaxed visual, spatial clustering)
-      - Stage 2.5: Lost Gallery search (re-identify expired tracks before creating new IDs)
-      - Stage 3: New global ID creation + immediate cross-camera dedup
-    """
-    # ── Matching thresholds (relaxed for robust cross-camera matching) ──
-    STAGE1_SIM_THRESH   = 0.60   # cosine similarity ≥ this for Stage 1 candidacy
-    STAGE1_DIST_THRESH  = 3.0    # meters – max spatial distance for Stage 1
-    STAGE1_COST_ACCEPT  = 0.35   # accept Stage 1 matches below this fused cost
-    STAGE2_SIM_THRESH   = 0.45   # relaxed cosine similarity for DBSCAN stage
-    DBSCAN_EPS          = 3.0    # meters – DBSCAN neighbourhood radius
-    DBSCAN_MIN_SAMPLES  = 2      # minimum cluster size
-
-    # ── Lost Gallery (re-identification of expired tracks) ──
-    LOST_SIM_THRESH     = 0.55   # minimum similarity to reclaim a lost ID
-    LOST_EXPIRY_SEC     = 120.0  # keep lost entries for 2 minutes
-
-    # ── Cross-camera dedup ──
-    DEDUP_SIM_THRESH    = 0.55   # merge new IDs from different cameras above this
-
-    def __init__(self, similarity_threshold=0.62,
-                 expiry_sec=30.0, max_speed_mps=5.0):
-        self.r = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=None)
+    def __init__(self):
+        cfg = load_config()
+        self.r = redis.Redis(host=cfg['redis']['host'], port=cfg['redis']['port'], db=0, socket_timeout=None)
         self.in_queue = "warehouse:queue:matcher"
         
-        self.sim_thresh    = similarity_threshold
-        self.expiry        = expiry_sec
-        self.max_speed_mps = max_speed_mps
+        m_cfg = cfg['matcher']
+        self.time_buffer_sec    = m_cfg['time_buffer_ms'] / 1000.0  # ── Upgrade 1: Jitter buffer size
+        self.max_speed_mps      = m_cfg['max_speed_mps']
+        self.lost_short_sec     = m_cfg['lost_short_term_sec']
+        self.lost_mid_sec       = m_cfg['lost_mid_term_sec']
+        self.reid_sim_threshold = m_cfg.get('reid_sim_threshold', 0.60)
         
-        self._gallery              = {}   # global_id -> GalleryEntry
-        self._lost_gallery         = {}   # global_id -> GalleryEntry (expired, awaiting re-ID)
-        self._cam_local_to_global  = {}   # (cam_id, local_id) -> global_id
-        self._next_id              = 1
-        self._expected_dim         = None # set from first embedding seen
+        self._gallery = {}
+        self._lost_gallery = {}
+        self._cam_local_to_global = {}
+        self._next_id = 1
+        self._jitter_buffer = []  # Holds raw messages waiting to be aligned
 
-    # ─────────────────────────────────────────────────────────────────
-    # Feature Bank similarity helper
-    # ─────────────────────────────────────────────────────────────────
     @staticmethod
     def _bank_similarity(feature_bank, query_emb):
-        """Return the maximum cosine similarity between query and all bank entries."""
+        """Matches query against the best view of the person."""
         return max(float(np.dot(emb, query_emb)) for emb in feature_bank)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Batch gathering
-    # ─────────────────────────────────────────────────────────────────
-    def _gather_batch(self, max_batch_size=32):
-        batch = []
-        # Block for a very short time waiting for the first element
-        res = self.r.blpop(self.in_queue, timeout=1)
-        if not res:
-            return batch
-            
-        batch.append(json.loads(res[1].decode('utf-8')))
-        
-        # Non-blocking pop to instantly grab everything else currently in the queue
-        while len(batch) < max_batch_size:
-            res = self.r.lpop(self.in_queue)
-            if res:
-                batch.append(json.loads(res.decode('utf-8')))
-            else:
-                break  # No more items, process immediately!
-                
-        return batch
-
-    # ─────────────────────────────────────────────────────────────────
-    # Time-aligned spatial distance
-    # ─────────────────────────────────────────────────────────────────
     def _time_aligned_distance(self, data, entry):
-        """
-        Project the gallery entry's last position forward in time using its
-        velocity vector, then compute Euclidean distance to the detection.
-        This compensates for async camera timestamps.
-        """
-        ref_time  = data['timestamp']
-        time_diff = ref_time - entry.last_seen
-
-        # Project gallery entry forward using its velocity
+        time_diff = max(0, data['timestamp'] - entry.last_seen)
         projected_x = entry.last_x + entry.velocity_x * time_diff
         projected_y = entry.last_y + entry.velocity_y * time_diff
+        return math.hypot(data['world_x'] - projected_x, data['world_y'] - projected_y)
 
-        return math.hypot(data['world_x'] - projected_x,
-                          data['world_y'] - projected_y)
-
-    # ─────────────────────────────────────────────────────────────────
-    # Main batch processing – Multi-stage matching
-    # ─────────────────────────────────────────────────────────────────
-    def process_batch(self, batch):
-        unmatched_items = []
+    # ── Upgrade 1: Jitter Buffer / Time Windowing ──
+    def _gather_and_align_windows(self):
+        """Pulls from Redis, sorts by time, and yields perfectly aligned temporal windows."""
+        # Drain all currently available messages quickly
+        while True:
+            res = self.r.lpop(self.in_queue)
+            if not res: break
+            self._jitter_buffer.append(msgpack.unpackb(res, strict_map_key=False))
         
+        if not self._jitter_buffer:
+            # Wait for at least one message if buffer is empty
+            res = self.r.blpop(self.in_queue, timeout=1)
+            if res: self._jitter_buffer.append(msgpack.unpackb(res[1], strict_map_key=False))
+
+        # Sort buffer chronologically
+        self._jitter_buffer.sort(key=lambda x: x['timestamp'])
+
+        current_time = time.time()
+        ready_windows = []
+
+        # Only process items that are older than our Jitter Buffer window size
+        while self._jitter_buffer and (current_time - self._jitter_buffer[0]['timestamp'] >= self.time_buffer_sec):
+            window_start_time = self._jitter_buffer[0]['timestamp']
+            
+            # Find all items that fall within this exact time window
+            window_items = []
+            while self._jitter_buffer and self._jitter_buffer[0]['timestamp'] <= window_start_time + self.time_buffer_sec:
+                window_items.append(self._jitter_buffer.pop(0))
+            
+            ready_windows.append(window_items)
+
+        return ready_windows
+
+    def process_window(self, batch):
+        unmatched_items = []
         for data in batch:
             emb = np.array(data['embedding'], dtype=np.float32)
-            # Normalize embedding
-            n = np.linalg.norm(emb)
-            if n > 0:
-                emb = emb / n
-            data['features_norm'] = emb
+            data['features_norm'] = emb / np.linalg.norm(emb) if np.linalg.norm(emb) > 0 else emb
             
-            # Set expected dimension from first embedding seen
-            if self._expected_dim is None:
-                self._expected_dim = emb.shape[0]
-                log.info(f"Feature dimension set to {self._expected_dim}")
-            
-            # Skip items with wrong feature dimensions
-            if emb.shape[0] != self._expected_dim:
-                log.warning(f"Skipping item with dim {emb.shape[0]} (expected {self._expected_dim})")
-                continue
-            
-            cam_id   = data['cam_id']
-            local_id = int(data['local_track_id'])
-            key      = (cam_id, local_id)
-            
-            # ── Stage 0: Identity Lock ──
-            # Pre-locked tracks bypass Hungarian matching entirely
+            key = (data['cam_id'], int(data['local_track_id']))
             if key in self._cam_local_to_global and self._cam_local_to_global[key] in self._gallery:
-                gid = self._cam_local_to_global[key]
-                self._update_entry(gid, emb, data, cam_id)
-                self.r.hset("global_id_map", f"{cam_id}:{local_id}", gid)
+                self._update_entry(self._cam_local_to_global[key], data)
             else:
                 unmatched_items.append(data)
                 
-        if not unmatched_items:
-            return
-            
-        # If gallery is empty, everything is new — then immediately deduplicate
-        if not self._gallery:
-            for data in unmatched_items:
-                self._create_new_id(data)
-            self._cross_camera_dedup()
-            return
-
-        # ── Stage 1: High-Confidence Hungarian Matching ──
-        still_unmatched = self._stage1_hungarian(unmatched_items)
-
-        # ── Stage 2: DBSCAN Spatial-Density Backup ──
-        still_unmatched = self._stage2_dbscan(still_unmatched)
-
-        # ── Stage 2.5: Search Lost Gallery before creating new IDs ──
-        still_unmatched = self._stage_lost_gallery(still_unmatched)
-
-        # ── Stage 3: Create new IDs for anything left ──
-        for data in still_unmatched:
-            self._create_new_id(data)
-
-        # ── Post-processing: Merge duplicate cross-camera IDs ──
-        if still_unmatched:
+        if unmatched_items:
+            still_unmatched = self._stage1_hungarian(unmatched_items)
+            still_unmatched = self._stage_cascade_lost_gallery(still_unmatched) # ── Upgrade 5
+            for data in still_unmatched: self._create_new_id(data)
             self._cross_camera_dedup()
 
-    # ─────────────────────────────────────────────────────────────────
-    # Stage 1: High-confidence Hungarian
-    # ─────────────────────────────────────────────────────────────────
     def _stage1_hungarian(self, items):
-        """
-        Match tracks where BOTH visual cosine similarity AND spatial distance
-        are strong enough. Uses the Hungarian algorithm for optimal 1:1
-        assignment.
-        """
-        gallery_gids  = list(self._gallery.keys())
-        num_items     = len(items)
-        num_gallery   = len(gallery_gids)
-
-        # Initialize cost matrix at 1000.0 (unmatchable)
-        cost_matrix = np.full((num_items, num_gallery), 1000.0, dtype=np.float32)
+        if not self._gallery: return items
+        
+        gallery_gids = list(self._gallery.keys())
+        cost_matrix = np.full((len(items), len(gallery_gids)), 1000.0, dtype=np.float32)
         
         for i, data in enumerate(items):
+            cam_id = data['cam_id']
+            local_id = int(data['local_track_id'])
+            
             for j, gid in enumerate(gallery_gids):
                 entry = self._gallery[gid]
                 
-                # Time-aligned spatial distance
+                # --- FIX 3: Immune to Queue Lag ---
+                if cam_id in entry.active_local_ids and entry.active_local_ids[cam_id] != local_id:
+                    # Use absolute difference between stream timestamps!
+                    time_diff = abs(data['timestamp'] - entry.last_cam_update.get(cam_id, 0))
+                    if time_diff < 1.5:
+                        continue # They are both in the frame at the same time. Cost stays 1000.0.
+
                 spatial_dist = self._time_aligned_distance(data, entry)
-
-                # Spatio-Temporal Constraint: use a 0.5s grace period to prevent
-                # minor async timestamps from creating infinite fake speeds
                 time_diff_safe = max(0.5, data['timestamp'] - entry.last_seen)
-                speed_safe = spatial_dist / time_diff_safe
                 
-                if speed_safe > self.max_speed_mps:
-                    continue  # physically impossible movement -> cost stays 1000.0
+                if (spatial_dist / time_diff_safe) > self.max_speed_mps or spatial_dist > 3.0: 
+                    continue
                 
-                # Spatial gate
-                if spatial_dist > self.STAGE1_DIST_THRESH:
-                    continue  # too far
-
-                # Feature Bank: max cosine similarity across all stored embeddings
                 sim = self._bank_similarity(entry.feature_bank, data['features_norm'])
+                if sim >= 0.60:
+                    cost_matrix[i, j] = (1.0 - sim) * 0.6 + (spatial_dist / 3.0) * 0.4
                 
-                if sim < self.STAGE1_SIM_THRESH:
-                    continue  # visual match not strong enough
-
-                cost_visual  = 1.0 - sim
-                cost_spatial = min(1.0, spatial_dist / self.STAGE1_DIST_THRESH)
-
-                # Adaptive Weighting based on keypoint quality
-                kp_quality = data.get('keypoint_quality', 'high')
-                if data.get('occluded', False) or kp_quality == 'low':
-                    alpha = 0.8   # Trust visual more when spatial is unreliable
-                else:
-                    alpha = 0.6   # Default: 60% Visual, 40% Spatial
-                    
-                cost_matrix[i, j] = alpha * cost_visual + (1.0 - alpha) * cost_spatial
-                
-        # Solve Hungarian
         row_inds, col_inds = linear_sum_assignment(cost_matrix)
-        
         assigned_rows = set()
+        
         for row, col in zip(row_inds, col_inds):
-            cost = cost_matrix[row, col]
-            if cost < self.STAGE1_COST_ACCEPT:
-                data     = items[row]
-                gid      = gallery_gids[col]
-                cam_id   = data['cam_id']
-                local_id = int(data['local_track_id'])
-                
-                log.info(f"Stage1 Match: global_id={gid} (cam={cam_id} local={local_id} cost={cost:.3f})")
-                
-                self._cam_local_to_global[(cam_id, local_id)] = gid
-                self._update_entry(gid, data['features_norm'], data, cam_id)
-                self.r.hset("global_id_map", f"{cam_id}:{local_id}", gid)
+            if cost_matrix[row, col] < 0.35:
+                data, gid = items[row], gallery_gids[col]
+                self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = gid
+                self._update_entry(gid, data)
+                self.r.hset("global_id_map", f"{data['cam_id']}:{data['local_track_id']}", gid)
                 assigned_rows.add(row)
 
-        # Return items that were NOT matched in Stage 1
         return [items[i] for i in range(len(items)) if i not in assigned_rows]
 
-    # ─────────────────────────────────────────────────────────────────
-    # Stage 2: DBSCAN spatial-density backup
-    # ─────────────────────────────────────────────────────────────────
-    def _stage2_dbscan(self, items):
-        """
-        For remaining unmatched tracks, use DBSCAN to cluster by spatial
-        proximity. Within each cluster, match by best cosine similarity.
-        """
-        if not items or not self._gallery:
-            return items
-
-        gallery_entries = list(self._gallery.values())
-        gallery_gids    = [e.global_id for e in gallery_entries]
-
-        # Build a combined coordinate array: [detections..., gallery_entries...]
-        det_coords = np.array([[d['world_x'], d['world_y']] for d in items])
-        gal_coords = np.array([[e.last_x, e.last_y] for e in gallery_entries])
-        all_coords = np.vstack([det_coords, gal_coords])
-
-        n_det = len(items)
-        n_gal = len(gallery_entries)
-
-        # Run DBSCAN on spatial coordinates
-        clustering = DBSCAN(eps=self.DBSCAN_EPS, min_samples=self.DBSCAN_MIN_SAMPLES,
-                            metric='euclidean').fit(all_coords)
-        labels = clustering.labels_
-
-        assigned_rows = set()
-
-        # Process each cluster
-        unique_labels = set(labels)
-        for label in unique_labels:
-            if label == -1:
-                continue  # noise points – skip
-
-            # Indices in the combined array belonging to this cluster
-            cluster_mask   = (labels == label)
-            det_in_cluster = [i for i in range(n_det) if cluster_mask[i]]
-            gal_in_cluster = [i - n_det for i in range(n_det, n_det + n_gal) if cluster_mask[i]]
-
-            if not det_in_cluster or not gal_in_cluster:
-                continue  # need at least one detection AND one gallery entry
-
-            # Within cluster: find best cosine-similarity match for each detection
-            for di in det_in_cluster:
-                if di in assigned_rows:
-                    continue
-                data      = items[di]
-                best_sim  = -1.0
-                best_gidx = -1
-
-                for gi in gal_in_cluster:
-                    entry = gallery_entries[gi]
-                    sim = self._bank_similarity(entry.feature_bank, data['features_norm'])
-                    if sim > best_sim:
-                        best_sim  = sim
-                        best_gidx = gi
-
-                if best_sim >= self.STAGE2_SIM_THRESH and best_gidx >= 0:
-                    entry    = gallery_entries[best_gidx]
-                    gid      = entry.global_id
-                    cam_id   = data['cam_id']
-                    local_id = int(data['local_track_id'])
-
-                    log.info(f"Stage2 DBSCAN Match: global_id={gid} "
-                             f"(cam={cam_id} local={local_id} sim={best_sim:.3f})")
-
-                    self._cam_local_to_global[(cam_id, local_id)] = gid
-                    self._update_entry(gid, data['features_norm'], data, cam_id)
-                    self.r.hset("global_id_map", f"{cam_id}:{local_id}", gid)
-                    assigned_rows.add(di)
-
-        # Return items that were NOT matched in Stage 2
-        return [items[i] for i in range(len(items)) if i not in assigned_rows]
-
-    # ─────────────────────────────────────────────────────────────────
-    # Stage 2.5: Lost Gallery Search (re-identify expired tracks)
-    # ─────────────────────────────────────────────────────────────────
-    def _stage_lost_gallery(self, items):
-        """
-        Before creating a brand-new global ID, check if this person was
-        recently tracked but expired. If their visual appearance matches
-        a lost entry, reclaim the original global ID instead of creating
-        a new one. This prevents ID fragmentation when people briefly
-        leave the frame or switch between cameras.
-        """
-        if not items or not self._lost_gallery:
-            return items
-
+    # ── Upgrade 5: Spatiotemporal Cascade Match for Lost IDs ──
+    def _stage_cascade_lost_gallery(self, items):
         still_unmatched = []
+        now = time.time()
+        
         for data in items:
-            best_sim = -1.0
-            best_gid = None
-
+            best_gid, best_sim = None, -1.0
+            
             for gid, entry in self._lost_gallery.items():
+                time_lost = now - entry.last_seen
                 sim = self._bank_similarity(entry.feature_bank, data['features_norm'])
-                if sim > best_sim:
-                    best_sim = sim
-                    best_gid = gid
+                
+                # Cascade 1: Short term lost (Occlusion). Require spatial + visual
+                if time_lost <= self.lost_short_sec:
+                    spatial_dist = self._time_aligned_distance(data, entry)
+                    if spatial_dist < 4.0 and sim > 0.55 and sim > best_sim:
+                        best_sim, best_gid = sim, gid
+                
+                # Cascade 2: Mid term lost (Left room). Purely visual, strict threshold
+                elif time_lost <= self.lost_mid_sec:
+                    if sim > 0.80 and sim > best_sim:  # Stricter visual requirement
+                        best_sim, best_gid = sim, gid
 
-            if best_sim >= self.LOST_SIM_THRESH and best_gid is not None:
-                # Reclaim the lost ID — move it back to active gallery
+            if best_gid:
                 entry = self._lost_gallery.pop(best_gid)
-                cam_id   = data['cam_id']
-                local_id = int(data['local_track_id'])
-
-                log.info(f"Reclaimed lost global_id={best_gid} "
-                         f"(cam={cam_id} local={local_id} sim={best_sim:.3f})")
-
-                # Re-activate the entry
-                entry.last_seen  = data['timestamp']
-                entry.last_x     = data['world_x']
-                entry.last_y     = data['world_y']
-                entry.velocity_x = data.get('velocity_x', 0.0)
-                entry.velocity_y = data.get('velocity_y', 0.0)
-                entry.feature_bank.append(data['features_norm'])
-                if len(entry.feature_bank) > 5:
-                    entry.feature_bank.pop(0)
-                entry.cam_history.add(cam_id)
-
                 self._gallery[best_gid] = entry
-                self._cam_local_to_global[(cam_id, local_id)] = best_gid
-                self.r.hset("global_id_map", f"{cam_id}:{local_id}", best_gid)
+                self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = best_gid
+                self._update_entry(best_gid, data)
+                self.r.hset("global_id_map", f"{data['cam_id']}:{data['local_track_id']}", best_gid)
+                log.info(f"Reclaimed lost ID {best_gid} via Cascade (sim={best_sim:.3f})")
             else:
                 still_unmatched.append(data)
-
+                
         return still_unmatched
 
-    # ─────────────────────────────────────────────────────────────────
-    # Cross-camera deduplication
-    # ─────────────────────────────────────────────────────────────────
     def _cross_camera_dedup(self):
-        """
-        After creating new IDs, check if any two IDs from DIFFERENT cameras
-        are visually the same person. If so, merge them into one ID.
-        This prevents the initial burst of duplicate IDs when the system starts.
-        """
         gids = list(self._gallery.keys())
-        if len(gids) < 2:
-            return
-
         merged = set()
+        
         for i in range(len(gids)):
-            if gids[i] in merged:
-                continue
-            entry_a = self._gallery.get(gids[i])
-            if entry_a is None:
-                continue
-
+            if gids[i] in merged: continue
             for j in range(i + 1, len(gids)):
-                if gids[j] in merged:
-                    continue
-                entry_b = self._gallery.get(gids[j])
-                if entry_b is None:
-                    continue
+                if gids[j] in merged: continue
+                
+                entry_a, entry_b = self._gallery[gids[i]], self._gallery[gids[j]]
+                if entry_a.cam_history == entry_b.cam_history: continue # Don't merge same-cam
+                
+                # --- FIX 4: Dedup Queue Lag Fix ---
+                conflict = False
+                shared_cams = set(entry_a.active_local_ids.keys()).intersection(set(entry_b.active_local_ids.keys()))
+                for cam in shared_cams:
+                    if entry_a.active_local_ids[cam] != entry_b.active_local_ids[cam]:
+                        # Are they alive at the same time? Use absolute stream timestamps!
+                        time_diff = abs(entry_a.last_cam_update[cam] - entry_b.last_cam_update[cam])
+                        if time_diff < 2.0: # 2.0 seconds window for extra safety
+                            conflict = True
+                            break
+                if conflict: continue
 
-                # Only merge across different cameras
-                if entry_a.cam_history == entry_b.cam_history:
-                    continue
-
-                # Check visual similarity between their feature banks
-                best_sim = -1.0
-                for emb_a in entry_a.feature_bank:
-                    for emb_b in entry_b.feature_bank:
-                        sim = float(np.dot(emb_a, emb_b))
-                        if sim > best_sim:
-                            best_sim = sim
-
-                if best_sim >= self.DEDUP_SIM_THRESH:
-                    # Merge entry_b into entry_a (keep the lower ID)
-                    keep_gid = min(gids[i], gids[j])
-                    drop_gid = max(gids[i], gids[j])
-
-                    keep_entry = self._gallery[keep_gid]
-                    drop_entry = self._gallery[drop_gid]
-
-                    # Merge feature banks
-                    for emb in drop_entry.feature_bank:
-                        keep_entry.feature_bank.append(emb)
-                    if len(keep_entry.feature_bank) > 5:
-                        keep_entry.feature_bank = keep_entry.feature_bank[-5:]
-
-                    # Merge camera history
-                    keep_entry.cam_history.update(drop_entry.cam_history)
-
-                    # Update all local→global mappings that pointed to drop_gid
+                best_sim = max(float(np.dot(ea, eb)) for ea in entry_a.feature_bank for eb in entry_b.feature_bank)
+                if best_sim >= 0.55:
+                    keep, drop = min(gids[i], gids[j]), max(gids[i], gids[j])
+                    self._gallery[keep].feature_bank.extend(self._gallery[drop].feature_bank)
+                    self._gallery[keep].feature_bank = self._gallery[keep].feature_bank[-5:]
+                    self._gallery[keep].cam_history.update(self._gallery[drop].cam_history)
+                    
                     for k, v in list(self._cam_local_to_global.items()):
-                        if v == drop_gid:
-                            self._cam_local_to_global[k] = keep_gid
-                            cam_id, local_id = k
-                            self.r.hset("global_id_map", f"{cam_id}:{local_id}", keep_gid)
+                        if v == drop:
+                            self._cam_local_to_global[k] = keep
+                            self.r.hset("global_id_map", f"{k[0]}:{k[1]}", keep)
+                            
+                    del self._gallery[drop]
+                    merged.add(drop)
+                    log.info(f"Dedup: Merged {drop} into {keep}")
 
-                    # Remove the duplicate
-                    del self._gallery[drop_gid]
-                    merged.add(drop_gid)
-
-                    log.info(f"Dedup: merged global_id={drop_gid} into global_id={keep_gid} "
-                             f"(sim={best_sim:.3f})")
-
-    # ─────────────────────────────────────────────────────────────────
-    # ID creation and entry updates
-    # ─────────────────────────────────────────────────────────────────
     def _create_new_id(self, data):
-        gid      = self._next_id
-        self._next_id += 1
-        cam_id   = data['cam_id']
-        local_id = int(data['local_track_id'])
+        gid, self._next_id = self._next_id, self._next_id + 1
         
         self._gallery[gid] = GalleryEntry(
-            gid, data['features_norm'], data['timestamp'],
-            data['world_x'], data['world_y'], cam_id,
-            velocity_x=data.get('velocity_x', 0.0),
-            velocity_y=data.get('velocity_y', 0.0)
+            gid, 
+            data['local_track_id'], # <--- FIX 2: Pass local track id here
+            data['features_norm'], 
+            data['timestamp'], 
+            data['world_x'], 
+            data['world_y'], 
+            data['cam_id'], 
+            data.get('velocity_x', 0), 
+            data.get('velocity_y', 0)
         )
-        self._cam_local_to_global[(cam_id, local_id)] = gid
-        self.r.hset("global_id_map", f"{cam_id}:{local_id}", gid)
-        
-        log.info(f"New global_id={gid} (cam={cam_id} local={local_id})")
+        self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = gid
+        self.r.hset("global_id_map", f"{data['cam_id']}:{data['local_track_id']}", gid)
+        log.info(f"New global_id={gid}")
 
-    def _update_entry(self, gid, emb, data, cam_id):
-        """Update a gallery entry with new observation (Feature Bank + velocity)."""
+    def _update_entry(self, gid, data):
         e = self._gallery[gid]
+        sim_to_best = self._bank_similarity(e.feature_bank, data['features_norm'])
         
-        # Append to Feature Bank (max 5)
-        e.feature_bank.append(emb)
-        if len(e.feature_bank) > 5:
-            e.feature_bank.pop(0)  # Remove oldest
-            
-        e.last_seen   = data['timestamp']
-        e.last_x      = data['world_x']
-        e.last_y      = data['world_y']
-        e.velocity_x  = data.get('velocity_x', 0.0)
-        e.velocity_y  = data.get('velocity_y', 0.0)
-        e.cam_history.add(cam_id)
+        if sim_to_best < 0.90:  
+            e.feature_bank.append(data['features_norm'])
+            if len(e.feature_bank) > 5: e.feature_bank.pop(0)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Track expiry (move to Lost Gallery instead of deleting)
-    # ─────────────────────────────────────────────────────────────────
-    def cleanup(self):
-        now = time.time()
+        e.last_seen, e.last_x, e.last_y = data['timestamp'], data['world_x'], data['world_y']
+        e.velocity_x, e.velocity_y = data.get('velocity_x', 0), data.get('velocity_y', 0)
+        e.cam_history.add(data['cam_id'])
+        
+        # --- MUTUAL EXCLUSIVITY FIX ---
+        e.active_local_ids[data['cam_id']] = int(data['local_track_id'])
+        e.last_cam_update[data['cam_id']] = data['timestamp']
 
-        # Move stale active tracks to the Lost Gallery (instead of deleting)
-        stale = [gid for gid, e in self._gallery.items() if now - e.last_seen > self.expiry]
-        for gid in stale:
-            log.info(f"Expiring global_id={gid} → moved to lost gallery for re-identification.")
-            entry = self._gallery.pop(gid)
-            self._lost_gallery[gid] = entry  # Keep for re-identification
-
-            # Remove the cam_local→global mapping so Stage 0 doesn't try to use the expired entry
-            for k, v in list(self._cam_local_to_global.items()):
-                if v == gid:
-                    cam_id, local_id = k
-                    self.r.hdel("global_id_map", f"{cam_id}:{local_id}")
-                    del self._cam_local_to_global[k]
-
-        # Permanently delete truly old lost entries
-        lost_stale = [gid for gid, e in self._lost_gallery.items()
-                      if now - e.last_seen > self.LOST_EXPIRY_SEC]
-        for gid in lost_stale:
-            del self._lost_gallery[gid]
-
-    # ─────────────────────────────────────────────────────────────────
-    # Main loop
-    # ─────────────────────────────────────────────────────────────────
     def run(self):
-        log.info("Starting Multi-Stage Global Matcher (Feature Bank + Lost Gallery + Dedup)...")
+        log.info("Starting Global Matcher (Jitter Buffer + Kalman + msgpack)...")
         last_cleanup = time.time()
         
         while True:
-            # Periodically cleanup expired tracks
-            if time.time() - last_cleanup > 5.0:
-                self.cleanup()
-                last_cleanup = time.time()
-                
-            batch = self._gather_batch(max_batch_size=32)
-            if batch:
-                self.process_batch(batch)
-                
-                # Enriched gallery snapshot for dashboard
+            # Move old IDs to lost, or delete entirely
+            if time.time() - last_cleanup > 2.0:
                 now = time.time()
-                snapshot = {
-                    "unique_people": len(self._gallery),
-                    "next_id": self._next_id,
-                    "lost_count": len(self._lost_gallery),
-                    "entries": [{
-                        "global_id":  e.global_id,
-                        "last_x":     round(e.last_x, 2),
-                        "last_y":     round(e.last_y, 2),
-                        "velocity_x": round(e.velocity_x, 2),
-                        "velocity_y": round(e.velocity_y, 2),
-                        "age_sec":    round(now - e.last_seen, 1),
-                        "cameras":    sorted(e.cam_history),
-                    } for e in self._gallery.values()]
-                }
-                self.r.set("state:gallery", json.dumps(snapshot))
+                for gid in [g for g, e in self._gallery.items() if now - e.last_seen > self.lost_short_sec]:
+                    self._lost_gallery[gid] = self._gallery.pop(gid)
+                    for k, v in list(self._cam_local_to_global.items()):
+                        if v == gid:
+                            self.r.hdel("global_id_map", f"{k[0]}:{k[1]}")
+                            del self._cam_local_to_global[k]
+                
+                for gid in [g for g, e in self._lost_gallery.items() if now - e.last_seen > self.lost_mid_sec]:
+                    del self._lost_gallery[gid]
+                last_cleanup = now
+                
+            windows = self._gather_and_align_windows()
+            for window in windows:
+                self.process_window(window)
+                
+            # Dashboard State remains JSON for Streamlit's text parser
+            now = time.time()
+            snapshot = {
+                "unique_people": len(self._gallery),
+                "next_id": self._next_id,
+                "entries": [{"global_id": e.global_id, "last_x": round(e.last_x, 2), "last_y": round(e.last_y, 2), "cameras": sorted(e.cam_history)} for e in self._gallery.values()]
+            }
+            self.r.set("state:gallery", json.dumps(snapshot))
 
 if __name__ == "__main__":
-    matcher = GlobalMatcher()
-    matcher.run()
+    GlobalMatcher().run()

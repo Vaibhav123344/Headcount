@@ -4,13 +4,24 @@
 echo "Starting Database Initialization..."
 python workers/init_db.py
 
-echo "Starting Global Matcher..."
-python workers/global_matcher.py &
+if [ "$1" == "--tune" ]; then
+    echo "Running in TUNING MODE (Global Matcher disabled)."
+else
+    echo "Starting Global Matcher..."
+    python workers/global_matcher.py &
+fi
 
-
-echo "Starting Single Camera Trackers (Pose + Homography)..."
-python workers/sct_worker.py --cam_id cam1 --source videos/cam2.mp4 --homography calibration/cam1_matrix.npy &
-python workers/sct_worker.py --cam_id cam2 --source videos/cam3.mp4 --homography calibration/cam2_matrix.npy &
+echo "Starting Single Camera Trackers based on config.json..."
+python -c '
+import json, os
+cfg = json.load(open("config.json"))
+for cid, cinfo in cfg.get("cameras", {}).items():
+    vpath = cinfo["video_path"]
+    mpath = cinfo["matrix_path"]
+    cmd = f"python workers/sct_worker.py --cam_id {cid} --source {vpath} --homography {mpath} &"
+    print("Launching:", cmd)
+    os.system(cmd)
+'
 
 echo "Starting Streamlit Dashboard..."
 python -m streamlit run dashboard.py --server.headless true &

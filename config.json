@@ -1,16 +1,24 @@
 {
+  "redis": {
+    "host": "localhost",
+    "port": 6379
+  },
+  "matcher": {
+    "time_buffer_ms": 150,
+    "max_speed_mps": 5.0,
+    "feature_bank_size": 5,
+    "lost_short_term_sec": 5.0,
+    "lost_mid_term_sec": 60.0,
+    "reid_sim_threshold": 0.60
+  },
   "cameras": {
-    "cam_00": {
-      "video_path": "videos/cam_00.mp4",
-      "matrix_path": "calibration/cam_00_matrix.npy"
+    "cam2": {
+      "video_path": "videos/cam2.mp4",
+      "matrix_path": "calibration/cam2_matrix.npy"
     },
-    "cam_01": {
-      "video_path": "videos/cam_01.mp4",
-      "matrix_path": "calibration/cam_01_matrix.npy"
-    },
-    "cam_02": {
-      "video_path": "videos/cam_02.mp4",
-      "matrix_path": "calibration/cam_02_matrix.npy"
+    "cam3": {
+      "video_path": "videos/cam3.mp4",
+      "matrix_path": "calibration/cam3_matrix.npy"
     }
   }
 }

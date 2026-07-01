@@ -10,6 +10,8 @@ NEW FEATURES:
     which areas have already been covered.
   - MODERN HUD PANEL: A semi-transparent overlay shows points count, active
     pairs list, RANSAC fit error, and staging status.
+  - DYNAMIC RE-PAIRING: Pairs persist even when tracks are lost. Click to
+    reassign track IDs to existing pairs when people reappear with new IDs.
 
 Controls:
     click cam1 then cam2   pair the same person across views
@@ -84,6 +86,14 @@ def foot_from_ankles(keypoints_data, idx):
     return None, False
 
 
+def find_pair_by_tid(pairs, ci, tid):
+    """Return (index, pair_dict) if tid is paired on camera ci, else (None, None)."""
+    for idx, pair in enumerate(pairs):
+        if pair["cam_tids"][ci] == tid:
+            return idx, pair
+    return None, None
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Interactive Multi-Person Track Calibration for Headcount.")
@@ -127,9 +137,11 @@ def main():
 
     # ─── State ────────────────────────────────────────────────────────
     pts_a, pts_b      = [], []          # global list of correspondences
-    active_pairs      = {}              # cam1_tid -> cam2_tid
-    pair_colors       = {}              # cam1_tid -> (B, G, R)
-    last_recorded     = {}              # cam1_tid -> (foot1, foot2)
+    # Dynamic pair system: each pair is a persistent slot with:
+    #   "id": int, "color": (B,G,R), "cam_tids": [cam1_tid|None, cam2_tid|None],
+    #   "last_recorded": (foot1, foot2)|None
+    # Pairs survive track-ID changes — click to reassign when tracks reappear.
+    pairs             = []              # list of pair dicts
     staged_click      = None            # (ci, tid) | None
     H                 = None            # fitted homography
     playing           = True
@@ -182,9 +194,10 @@ def main():
     print("=" * 70)
     print("  1. Click a person in the LEFT panel (cam1)")
     print("  2. Click the SAME person in the RIGHT panel (cam2) to PAIR them.")
-    print("  3. Repeat for up to 3-4 other walking people.")
+    print("  3. Repeat for more walking people (multi-person supported).")
     print("  4. Let them walk — points auto-collect concurrently.")
-    print("  5. Press 'f' to fit,  's' to save,  'q' to quit.")
+    print("  5. If a track is LOST, click the person again to reassign the pair.")
+    print("  6. Press 'f' to fit,  's' to save,  'q' to quit.")
     print("=" * 70 + "\n")
 
     while True:
@@ -239,7 +252,7 @@ def main():
                     })
             tracks_per.append(cam_tracks)
 
-        # ── Handle click → arm a track ────────────────────────────────
+        # ── Handle click → arm a track (dynamic re-pairing) ─────────
         if click["pos"] is not None:
             ci, p = click["pos"]
             click["pos"] = None
@@ -256,32 +269,73 @@ def main():
                 if staged_click is None:
                     # Stage the selection
                     staged_click = (ci, best_tid)
-                    print(f"  → Staged {names[ci]} track id={best_tid}. Click same person in the other panel.")
+                    pidx, _ = find_pair_by_tid(pairs, ci, best_tid)
+                    if pidx is not None:
+                        print(f"  → Staged {names[ci]} track id={best_tid} (Pair {pairs[pidx]['id']}). "
+                              f"Click other cam to reassign.")
+                    else:
+                        print(f"  → Staged {names[ci]} track id={best_tid}. "
+                              f"Click same person in the other panel.")
                 else:
                     sci, stid = staged_click
                     if sci == ci:
-                        # Overwrite staged selection (user changed mind)
+                        # Same camera — replace staged selection
                         staged_click = (ci, best_tid)
-                        print(f"  → Swapped staged selection to {names[ci]} track id={best_tid}.")
+                        print(f"  → Swapped staged selection to {names[ci]} "
+                              f"track id={best_tid}.")
                     else:
-                        # Pair completed!
-                        cam1_tid = stid if sci == 0 else best_tid
-                        cam2_tid = best_tid if sci == 0 else stid
-                        
-                        # Add to active pairs
-                        active_pairs[cam1_tid] = cam2_tid
-                        # Generate random distinct color for drawing
-                        color = (int(np.random.randint(50, 255)), 
-                                 int(np.random.randint(50, 255)), 
-                                 int(np.random.randint(50, 255)))
-                        pair_colors[cam1_tid] = color
-                        
-                        print(f"  ✓ PAIRED ACTIVE: cam1:{cam1_tid} ↔ cam2:{cam2_tid}")
+                        # Different cameras — form or update a pair!
+                        # Look up existing pair membership
+                        pidx_s, pair_s = find_pair_by_tid(pairs, sci, stid)
+                        pidx_n, pair_n = find_pair_by_tid(pairs, ci, best_tid)
+
+                        if (pidx_s is not None and pidx_n is not None
+                                and pidx_s == pidx_n):
+                            # Both already in the same pair
+                            print(f"  ✓ Already paired together in "
+                                  f"Pair {pairs[pidx_s]['id']}")
+                        elif pidx_s is not None:
+                            # Staged person owns a pair → update other cam
+                            if pidx_n is not None and pidx_n != pidx_s:
+                                pairs[pidx_n]["cam_tids"][ci] = None
+                            pair_s["cam_tids"][ci] = best_tid
+                            print(f"  ✓ Updated Pair {pair_s['id']}: "
+                                  f"cam1:{pair_s['cam_tids'][0]} ↔ "
+                                  f"cam2:{pair_s['cam_tids'][1]}")
+                        elif pidx_n is not None:
+                            # Clicked person owns a pair → update other cam
+                            pair_n["cam_tids"][sci] = stid
+                            print(f"  ✓ Updated Pair {pair_n['id']}: "
+                                  f"cam1:{pair_n['cam_tids'][0]} ↔ "
+                                  f"cam2:{pair_n['cam_tids'][1]}")
+                        else:
+                            # Neither has a pair → create new
+                            color = (int(np.random.randint(50, 255)),
+                                     int(np.random.randint(50, 255)),
+                                     int(np.random.randint(50, 255)))
+                            new_pair = {
+                                "id": len(pairs) + 1,
+                                "color": color,
+                                "cam_tids": [None, None],
+                                "last_recorded": None,
+                            }
+                            new_pair["cam_tids"][sci] = stid
+                            new_pair["cam_tids"][ci] = best_tid
+                            pairs.append(new_pair)
+                            print(f"  ✓ NEW Pair {new_pair['id']}: "
+                                  f"cam1:{new_pair['cam_tids'][0]} ↔ "
+                                  f"cam2:{new_pair['cam_tids'][1]}")
+
                         staged_click = None
 
         # ── Auto-collect points for all active pairs concurrently ───
-        if collecting and active_pairs:
-            for cam1_tid, cam2_tid in list(active_pairs.items()):
+        if collecting and pairs:
+            for pair in pairs:
+                cam1_tid = pair["cam_tids"][0]
+                cam2_tid = pair["cam_tids"][1]
+                if cam1_tid is None or cam2_tid is None:
+                    continue
+
                 foot1 = None
                 foot2 = None
                 
@@ -297,12 +351,12 @@ def main():
                 
                 if foot1 is not None and foot2 is not None:
                     # Enforce spread distance per pair
-                    last_pt = last_recorded.get(cam1_tid)
+                    last_pt = pair["last_recorded"]
                     if (last_pt is None or 
                         np.linalg.norm(foot1 - last_pt[0]) > MIN_SPREAD_PX):
                         pts_a.append(foot1.copy())
                         pts_b.append(foot2.copy())
-                        last_recorded[cam1_tid] = (foot1.copy(), foot2.copy())
+                        pair["last_recorded"] = (foot1.copy(), foot2.copy())
 
         # ── Draw ──────────────────────────────────────────────────────
         panels = []
@@ -318,25 +372,14 @@ def main():
                 # Check status of the track for coloring
                 is_staged = (staged_click is not None and staged_click == (ci, tid))
                 
-                # Check if it belongs to any active pair
-                is_paired = False
-                p_color = (180, 180, 180) # Default gray
+                # Dynamic pair lookup
+                pidx, matched_pair = find_pair_by_tid(pairs, ci, tid)
                 
-                if ci == 0:
-                    if tid in active_pairs:
-                        is_paired = True
-                        p_color = pair_colors[tid]
-                else:
-                    paired_c1 = [k for k, v in active_pairs.items() if v == tid]
-                    if paired_c1:
-                        is_paired = True
-                        p_color = pair_colors[paired_c1[0]]
-                        
                 if is_staged:
-                    col = (0, 255, 255) # Yellow for staged
+                    col = (0, 255, 255)  # Yellow for staged
                     thickness = 3
-                elif is_paired:
-                    col = p_color
+                elif pidx is not None:
+                    col = matched_pair["color"]
                     thickness = 2
                 else:
                     col = (180, 180, 180)
@@ -350,10 +393,18 @@ def main():
                 foot_col = (0, 255, 0) if t["ankle"] else (0, 165, 255)
                 cv2.circle(disp, (fpx, fpy), 5, foot_col, -1)
 
-                # Draw track label
+                # Draw track label with dynamic pair status
                 label = f"ID: {tid}"
-                if is_paired:
-                    label += " [PAIRED]"
+                if pidx is not None:
+                    other_ci = 1 - ci
+                    other_tid = matched_pair["cam_tids"][other_ci]
+                    if other_tid is not None:
+                        other_visible = any(
+                            t2["tid"] == other_tid for t2 in tracks_per[other_ci])
+                        status = "OK" if other_visible else "LOST"
+                    else:
+                        status = "HALF"
+                    label += f" [P{matched_pair['id']}:{status}]"
                 if is_staged:
                     label += " [STAGED]"
                 cv2.putText(disp, label, (x1, y1 - 4),
@@ -373,7 +424,20 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             # Draw a modern, semi-transparent HUD overlay in top-right
-            hud_w, hud_h = 240, 100
+            # Build per-pair status indicators
+            pair_indicators = []
+            for p in pairs[:4]:
+                c1_ok = p["cam_tids"][0] is not None and any(
+                    t["tid"] == p["cam_tids"][0] for t in tracks_per[0])
+                c2_ok = p["cam_tids"][1] is not None and any(
+                    t["tid"] == p["cam_tids"][1] for t in tracks_per[1])
+                s1 = "+" if c1_ok else "-"
+                s2 = "+" if c2_ok else "-"
+                pair_indicators.append(f"P{p['id']}:{s1}|{s2}")
+
+            n_extra = min(len(pairs), 4)
+            hud_w = 270
+            hud_h = 100 + n_extra * 18
             hud_x = PANEL_W - hud_w - 10
             hud_y = 40
             
@@ -386,15 +450,21 @@ def main():
             cv2.rectangle(disp, (hud_x, hud_y), (hud_x + hud_w, hud_y + hud_h), (80, 80, 80), 1)
             
             # HUD text lines
-            lines = [
-                f"Active Pairs: {len(active_pairs)}",
+            hud_lines = [
+                f"Pairs: {len(pairs)}  {' '.join(pair_indicators)}",
                 f"Points: {len(pts_a)} / {GOOD_POINTS}",
                 "RANSAC: " + (f"{reproj_err:.2f} px" if reproj_err else "not fitted"),
-                "Staged: " + (f"Cam{staged_click[0]+1} ID {staged_click[1]}" if staged_click else "None")
+                "Staged: " + (f"Cam{staged_click[0]+1} ID {staged_click[1]}" if staged_click else "None"),
             ]
-            for i, line in enumerate(lines):
-                cv2.putText(disp, line, (hud_x + 8, hud_y + 20 + i*20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            # Per-pair detail lines
+            for p in pairs[:4]:
+                c1t = p["cam_tids"][0]
+                c2t = p["cam_tids"][1]
+                hud_lines.append(f"  P{p['id']}: L={c1t if c1t else '-'}  R={c2t if c2t else '-'}")
+
+            for i, line in enumerate(hud_lines):
+                cv2.putText(disp, line, (hud_x + 8, hud_y + 18 + i*18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1, cv2.LINE_AA)
 
             panels.append((disp, sx, sy))
 
@@ -443,12 +513,10 @@ def main():
             collecting = not collecting
             print(f"  Auto-collection {'ON' if collecting else 'OFF'}")
         elif key == ord("x"):
-            # Clear all active pairs (resets pairings, but keeps accumulated points)
-            active_pairs.clear()
-            pair_colors.clear()
+            # Clear all pairs (keeps accumulated calibration points)
+            pairs.clear()
             staged_click = None
-            last_recorded.clear()
-            print("  ✓ Cleared active pairings (collected points are KEPT)")
+            print("  ✓ Cleared all pairs (collected points are KEPT)")
         elif key == ord("u") and pts_a:
             pts_a.pop()
             pts_b.pop()
@@ -456,13 +524,11 @@ def main():
         elif key == ord("r"):
             pts_a.clear()
             pts_b.clear()
-            active_pairs.clear()
-            pair_colors.clear()
+            pairs.clear()
             staged_click = None
-            last_recorded.clear()
             H = None
             reproj_err = None
-            print("  ✗ Reset all collected points and active pairings")
+            print("  ✗ Reset all collected points and pairs")
         elif key == ord("f"):
             fit()
         elif key == ord("s"):
@@ -470,8 +536,10 @@ def main():
                 fit()
             if H is not None:
                 os.makedirs(args.output_dir, exist_ok=True)
-                path_cam1 = os.path.join(args.output_dir, "cam1_matrix.npy")
-                path_cam2 = os.path.join(args.output_dir, "cam2_matrix.npy")
+                base1 = os.path.splitext(os.path.basename(args.video1))[0]
+                base2 = os.path.splitext(os.path.basename(args.video2))[0]
+                path_cam1 = os.path.join(args.output_dir, f"{base1}_matrix.npy")
+                path_cam2 = os.path.join(args.output_dir, f"{base2}_matrix.npy")
                 np.save(path_cam1, H)
                 np.save(path_cam2, np.eye(3))
                 print(f"\n  ✓ Saved {path_cam1}  (cam1 → cam2 homography)")
