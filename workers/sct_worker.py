@@ -86,30 +86,51 @@ class SCTWorker:
         key = f"{self.cam_id}:{int(local_track_id)}"
         return self.global_id_cache.get(key, None)
 
-    # ── Upgrade 1: Ankle keypoint extraction ──────────────────────────
+    # ── Upgrade 1: Hierarchical Keypoint Fallback ─────────────────────
     @staticmethod
-    def _extract_ankle_point(keypoints_data, idx):
-        """Return (foot_x, foot_y, True) from ankles, or (None, None, False)."""
+    def _extract_foot_point(keypoints_data, idx, box):
+        """Return (foot_x, foot_y, quality) where quality is 'high' (keypoint) or 'low' (bbox)."""
+        x1, y1, x2, y2 = box
+        fallback_x = (x1 + x2) / 2.0
+        fallback_y = float(y2)
+
         if keypoints_data is None:
-            return None, None, False
+            return fallback_x, fallback_y, 'low'
+        
         kpts = keypoints_data.data.cpu().numpy()
         if idx >= len(kpts):
-            return None, None, False
+            return fallback_x, fallback_y, 'low'
 
         person_kpts = kpts[idx]           # shape (17, 3) → [x, y, confidence]
+        
+        # 1. Try Ankles (15, 16)
         left_ankle  = person_kpts[15]
         right_ankle = person_kpts[16]
-
-        visible = []
+        visible_ankles = []
         if left_ankle[2]  > SCTWorker.ANKLE_CONF_THRESH:
-            visible.append(left_ankle[:2])
+            visible_ankles.append(left_ankle[:2])
         if right_ankle[2] > SCTWorker.ANKLE_CONF_THRESH:
-            visible.append(right_ankle[:2])
+            visible_ankles.append(right_ankle[:2])
+        
+        if visible_ankles:
+            avg = np.mean(visible_ankles, axis=0)
+            return float(avg[0]), float(avg[1]), 'high'
 
-        if visible:
-            avg = np.mean(visible, axis=0)
-            return float(avg[0]), float(avg[1]), True
-        return None, None, False
+        # 2. Try Knees (13, 14)
+        left_knee = person_kpts[13]
+        right_knee = person_kpts[14]
+        visible_knees = []
+        if left_knee[2] > SCTWorker.ANKLE_CONF_THRESH:
+            visible_knees.append(left_knee[:2])
+        if right_knee[2] > SCTWorker.ANKLE_CONF_THRESH:
+            visible_knees.append(right_knee[:2])
+            
+        if visible_knees:
+            avg = np.mean(visible_knees, axis=0)
+            return float(avg[0]), float(avg[1]), 'high'
+
+        # 3. Fallback to Bounding Box Base
+        return fallback_x, fallback_y, 'low'
 
     # ── Upgrade 2: Velocity vector computation ────────────────────────
     def _compute_velocity(self, local_id):
@@ -185,14 +206,8 @@ class SCTWorker:
                     # Skip very close-up crops for ReID (person filling >70% of frame)
                     skip_reid = bbox_h / frame_h > 0.7
 
-                    # ── Upgrade 1: Ankle-based foot localization ──
-                    ankle_x, ankle_y, used_ankle = self._extract_ankle_point(keypoints, idx)
-                    if used_ankle:
-                        foot_x, foot_y = ankle_x, ankle_y
-                    else:
-                        # Fallback: bottom-center of bounding box
-                        foot_x = (x1 + x2) / 2.0
-                        foot_y = float(y2)
+                    # ── Upgrade 1: Hierarchical foot localization ──
+                    foot_x, foot_y, kp_quality = self._extract_foot_point(keypoints, idx, (x1, y1, x2, y2))
 
                     # perspectiveTransform expects shape (N, 1, 2)
                     bottom_center = np.array([[[foot_x, foot_y]]], dtype=np.float32)
@@ -237,18 +252,7 @@ class SCTWorker:
                             if norm > 0:
                                 raw_features = raw_features / norm
 
-                            # EMA update: smooth embedding over time
-                            if local_id in self.track_embeddings:
-                                ema = ((1.0 - self.EMA_ALPHA) * self.track_embeddings[local_id]
-                                       + self.EMA_ALPHA * raw_features)
-                                n = np.linalg.norm(ema)
-                                if n > 0:
-                                    ema = ema / n
-                                self.track_embeddings[local_id] = ema
-                            else:
-                                self.track_embeddings[local_id] = raw_features
-
-                            # Send the STABLE EMA embedding, not the noisy raw frame embedding
+                            # Send the raw embedding; Global Matcher maintains the Feature Bank
                             payload = {
                                 "cam_id":           self.cam_id,
                                 "local_track_id":   local_id,
@@ -258,8 +262,9 @@ class SCTWorker:
                                 "velocity_x":       float(velocity_x),
                                 "velocity_y":       float(velocity_y),
                                 "occluded":         occluded,
+                                "keypoint_quality": kp_quality,
                                 "bbox_aspect_ratio": float(aspect_ratio),
-                                "embedding":        self.track_embeddings[local_id].tolist()
+                                "embedding":        raw_features.tolist()
                             }
                             self.r.rpush(self.queue_name, json.dumps(payload))
 
@@ -281,8 +286,8 @@ class SCTWorker:
                     cv2.putText(frame, label, (x1 + 3, y1 - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-                    # Draw foot point (ankle or fallback)
-                    foot_color = (0, 255, 0) if used_ankle else (0, 165, 255)  # green=ankle, orange=fallback
+                    # Draw foot point (keypoint or fallback)
+                    foot_color = (0, 255, 0) if kp_quality == 'high' else (0, 165, 255)  # green=keypoint, orange=bbox
                     cv2.circle(frame, (int(foot_x), int(foot_y)), 5, foot_color, -1)
 
                     # Draw occlusion indicator
