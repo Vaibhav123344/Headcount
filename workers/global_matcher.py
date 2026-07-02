@@ -111,6 +111,54 @@ class GlobalMatcher:
             for data in still_unmatched: self._create_new_id(data)
             self._cross_camera_dedup()
 
+    def _calculate_sota_probabilistic_cost(self, incoming_data, gallery_entry):
+        """
+        Implements SOTA Probabilistic Spatiotemporal Fusion using Time-Decaying Gaussian Uncertainty.
+        Returns a cost (0.0 to 1.0) for the Hungarian algorithm. Lower is better.
+        """
+        dt = incoming_data['timestamp'] - gallery_entry.last_seen
+        dt = max(0.01, dt) # Prevent division by zero
+
+        # 1. KINEMATIC PREDICTION (Where should they be?)
+        # Cap velocity prediction at 3 seconds. After that, humans change direction too much.
+        predict_dt = min(dt, 3.0)
+        pred_x = gallery_entry.last_x + (gallery_entry.velocity_x * predict_dt)
+        pred_y = gallery_entry.last_y + (gallery_entry.velocity_y * predict_dt)
+
+        # 2. EUCLIDEAN DISTANCE (Error between actual and predicted)
+        spatial_dist = math.hypot(incoming_data['world_x'] - pred_x, incoming_data['world_y'] - pred_y)
+
+        # --- THE SOTA PROBABILISTIC MATH ---
+
+        # 3. DYNAMIC UNCERTAINTY (Sigma)
+        # Base error of our Homography matrix is ~0.5m. 
+        # Uncertainty grows by ~1.2 meters every second they are out of sight.
+        sigma = 0.5 + (1.2 * dt) 
+
+        # 4. SPATIAL PROBABILITY (Gaussian Distribution)
+        # If distance is 0, P_spatial = 1.0. As distance grows, it drops smoothly toward 0.0.
+        p_spatial = math.exp(- (spatial_dist ** 2) / (2 * (sigma ** 2)))
+
+        # 5. VISUAL PROBABILITY (OSNet ReID)
+        # Assume _bank_similarity returns Cosine Similarity (-1.0 to 1.0). 
+        # We shift and scale it so 0.0 is entirely dissimilar, and 1.0 is identical.
+        raw_sim = self._bank_similarity(gallery_entry.feature_bank, incoming_data['features_norm'])
+        p_visual = max(0.0, raw_sim) # Clamp negative values
+
+        # 6. JOINT PROBABILITY
+        # The probability that this is the same person based on BOTH location and appearance.
+        joint_probability = p_spatial * p_visual
+
+        # 7. HARD GATING (Physical Limits)
+        # If the required speed to make this jump is impossible (> 5 m/s), block it completely.
+        if (spatial_dist / dt) > self.max_speed_mps:
+            return float('inf'), spatial_dist
+
+        # Hungarian algorithm requires COST (where 0.0 is perfect, 1.0 is worst)
+        final_cost = 1.0 - joint_probability
+        
+        return final_cost, spatial_dist
+
     def _stage1_hungarian(self, items):
         if not self._gallery: return items
         
@@ -131,21 +179,17 @@ class GlobalMatcher:
                     if time_diff < 1.5:
                         continue # They are both in the frame at the same time. Cost stays 1000.0.
 
-                spatial_dist = self._time_aligned_distance(data, entry)
-                time_diff_safe = max(0.5, data['timestamp'] - entry.last_seen)
-                
-                if (spatial_dist / time_diff_safe) > self.max_speed_mps or spatial_dist > 3.0: 
+                cost, spatial_dist = self._calculate_sota_probabilistic_cost(data, entry)
+                if cost == float('inf'):
                     continue
                 
-                sim = self._bank_similarity(entry.feature_bank, data['features_norm'])
-                if sim >= 0.60:
-                    cost_matrix[i, j] = (1.0 - sim) * 0.6 + (spatial_dist / 3.0) * 0.4
+                cost_matrix[i, j] = cost
                 
         row_inds, col_inds = linear_sum_assignment(cost_matrix)
         assigned_rows = set()
         
         for row, col in zip(row_inds, col_inds):
-            if cost_matrix[row, col] < 0.35:
+            if cost_matrix[row, col] < 0.70:
                 data, gid = items[row], gallery_gids[col]
                 self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = gid
                 self._update_entry(gid, data)
