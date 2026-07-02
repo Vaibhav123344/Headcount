@@ -9,6 +9,7 @@ def init_db():
     r.delete("warehouse:queue:matcher")
     r.delete("global_id_map")
     r.delete("state:gallery")
+    r.delete("reid_worker:ready")
     
     print("Database Initialized successfully.")
 

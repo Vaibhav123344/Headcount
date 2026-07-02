@@ -1,6 +1,6 @@
 import redis
 import json
-import msgpack # ── Upgrade 4: Binary Serialization
+import msgpack
 import numpy as np
 import time
 import math
@@ -15,7 +15,6 @@ def load_config():
         return json.load(f)
 
 class GalleryEntry:
-    # --- FIX 1: Add local_id to arguments ---
     def __init__(self, global_id, local_id, embedding, last_seen, last_x, last_y, cam_id, velocity_x=0.0, velocity_y=0.0):
         self.global_id  = global_id
         self.feature_bank = [embedding] 
@@ -26,7 +25,7 @@ class GalleryEntry:
         self.velocity_y  = velocity_y
         self.cam_history = {cam_id}
         
-        # --- FIX 1 (cont): Save actual local_id ---
+        # Save actual local_id to track stream presence 
         self.active_local_ids = {cam_id: int(local_id)} 
         self.last_cam_update = {cam_id: last_seen}
 
@@ -37,7 +36,7 @@ class GlobalMatcher:
         self.in_queue = "warehouse:queue:matcher"
         
         m_cfg = cfg['matcher']
-        self.time_buffer_sec    = m_cfg['time_buffer_ms'] / 1000.0  # ── Upgrade 1: Jitter buffer size
+        self.time_buffer_sec    = m_cfg['time_buffer_ms'] / 1000.0  
         self.max_speed_mps      = m_cfg['max_speed_mps']
         self.lost_short_sec     = m_cfg['lost_short_term_sec']
         self.lost_mid_sec       = m_cfg['lost_mid_term_sec']
@@ -47,7 +46,7 @@ class GlobalMatcher:
         self._lost_gallery = {}
         self._cam_local_to_global = {}
         self._next_id = 1
-        self._jitter_buffer = []  # Holds raw messages waiting to be aligned
+        self._jitter_buffer = []  
 
     @staticmethod
     def _bank_similarity(feature_bank, query_emb):
@@ -60,28 +59,40 @@ class GlobalMatcher:
         projected_y = entry.last_y + entry.velocity_y * time_diff
         return math.hypot(data['world_x'] - projected_x, data['world_y'] - projected_y)
 
-    # ── Upgrade 1: Jitter Buffer / Time Windowing ──
+    @staticmethod
+    def _normalize_keys(data):
+        """Convert all msgpack byte-keys to string-keys."""
+        return {
+            (k.decode('utf-8') if isinstance(k, bytes) else k): v
+            for k, v in data.items()
+        }
+
     def _gather_and_align_windows(self):
         """Pulls from Redis, sorts by time, and yields perfectly aligned temporal windows."""
         # Drain all currently available messages quickly
         while True:
             res = self.r.lpop(self.in_queue)
             if not res: break
-            self._jitter_buffer.append(msgpack.unpackb(res, strict_map_key=False))
+            self._jitter_buffer.append(self._normalize_keys(msgpack.unpackb(res, strict_map_key=False)))
         
         if not self._jitter_buffer:
             # Wait for at least one message if buffer is empty
             res = self.r.blpop(self.in_queue, timeout=1)
-            if res: self._jitter_buffer.append(msgpack.unpackb(res[1], strict_map_key=False))
+            if res: self._jitter_buffer.append(self._normalize_keys(msgpack.unpackb(res[1], strict_map_key=False)))
+
+        if not self._jitter_buffer:
+            return []
 
         # Sort buffer chronologically
         self._jitter_buffer.sort(key=lambda x: x['timestamp'])
 
-        current_time = time.time()
+        # FIX 1: Use the highest stream timestamp as current time. 
+        # Makes the buffer immune to system clock drift and queue lag.
+        latest_stream_time = self._jitter_buffer[-1]['timestamp']
         ready_windows = []
 
         # Only process items that are older than our Jitter Buffer window size
-        while self._jitter_buffer and (current_time - self._jitter_buffer[0]['timestamp'] >= self.time_buffer_sec):
+        while self._jitter_buffer and (latest_stream_time - self._jitter_buffer[0]['timestamp'] >= self.time_buffer_sec):
             window_start_time = self._jitter_buffer[0]['timestamp']
             
             # Find all items that fall within this exact time window
@@ -96,18 +107,34 @@ class GlobalMatcher:
     def process_window(self, batch):
         unmatched_items = []
         for data in batch:
+            # Defensive: skip items that arrived without an embedding key entirely
+            if 'embedding' not in data:
+                continue
+
             emb = np.array(data['embedding'], dtype=np.float32)
-            data['features_norm'] = emb / np.linalg.norm(emb) if np.linalg.norm(emb) > 0 else emb
+            emb_norm = np.linalg.norm(emb)
+            has_real_embedding = emb_norm > 0.01  # Zero embeddings from ReID worker have norm ~0
+
+            if has_real_embedding:
+                data['features_norm'] = emb / emb_norm
+            else:
+                data['features_norm'] = emb  # Keep as zero vector
             
             key = (data['cam_id'], int(data['local_track_id']))
             if key in self._cam_local_to_global and self._cam_local_to_global[key] in self._gallery:
-                self._update_entry(self._cam_local_to_global[key], data)
+                # ALREADY TRACKED: Always update position/velocity.
+                # Only update the feature bank if we have a real visual embedding.
+                self._update_entry(self._cam_local_to_global[key], data, update_features=has_real_embedding)
             else:
-                unmatched_items.append(data)
+                # UNMATCHED: Only attempt matching/creation if we have a real visual embedding.
+                # Without a real embedding, we can't visually match, and creating a new ID
+                # with a zero-vector would poison the gallery. Wait for the next ReID cycle.
+                if has_real_embedding:
+                    unmatched_items.append(data)
                 
         if unmatched_items:
             still_unmatched = self._stage1_hungarian(unmatched_items)
-            still_unmatched = self._stage_cascade_lost_gallery(still_unmatched) # ── Upgrade 5
+            still_unmatched = self._stage_cascade_lost_gallery(still_unmatched) 
             for data in still_unmatched: self._create_new_id(data)
             self._cross_camera_dedup()
 
@@ -117,10 +144,9 @@ class GlobalMatcher:
         Returns a cost (0.0 to 1.0) for the Hungarian algorithm. Lower is better.
         """
         dt = incoming_data['timestamp'] - gallery_entry.last_seen
-        dt = max(0.01, dt) # Prevent division by zero
+        dt = max(0.01, dt) 
 
         # 1. KINEMATIC PREDICTION (Where should they be?)
-        # Cap velocity prediction at 3 seconds. After that, humans change direction too much.
         predict_dt = min(dt, 3.0)
         pred_x = gallery_entry.last_x + (gallery_entry.velocity_x * predict_dt)
         pred_y = gallery_entry.last_y + (gallery_entry.velocity_y * predict_dt)
@@ -128,33 +154,23 @@ class GlobalMatcher:
         # 2. EUCLIDEAN DISTANCE (Error between actual and predicted)
         spatial_dist = math.hypot(incoming_data['world_x'] - pred_x, incoming_data['world_y'] - pred_y)
 
-        # --- THE SOTA PROBABILISTIC MATH ---
-
         # 3. DYNAMIC UNCERTAINTY (Sigma)
-        # Base error of our Homography matrix is ~0.5m. 
-        # Uncertainty grows by ~1.2 meters every second they are out of sight.
         sigma = 0.5 + (1.2 * dt) 
 
         # 4. SPATIAL PROBABILITY (Gaussian Distribution)
-        # If distance is 0, P_spatial = 1.0. As distance grows, it drops smoothly toward 0.0.
         p_spatial = math.exp(- (spatial_dist ** 2) / (2 * (sigma ** 2)))
 
         # 5. VISUAL PROBABILITY (OSNet ReID)
-        # Assume _bank_similarity returns Cosine Similarity (-1.0 to 1.0). 
-        # We shift and scale it so 0.0 is entirely dissimilar, and 1.0 is identical.
         raw_sim = self._bank_similarity(gallery_entry.feature_bank, incoming_data['features_norm'])
-        p_visual = max(0.0, raw_sim) # Clamp negative values
+        p_visual = max(0.0, raw_sim) 
 
         # 6. JOINT PROBABILITY
-        # The probability that this is the same person based on BOTH location and appearance.
         joint_probability = p_spatial * p_visual
 
         # 7. HARD GATING (Physical Limits)
-        # If the required speed to make this jump is impossible (> 5 m/s), block it completely.
         if (spatial_dist / dt) > self.max_speed_mps:
             return float('inf'), spatial_dist
 
-        # Hungarian algorithm requires COST (where 0.0 is perfect, 1.0 is worst)
         final_cost = 1.0 - joint_probability
         
         return final_cost, spatial_dist
@@ -172,12 +188,11 @@ class GlobalMatcher:
             for j, gid in enumerate(gallery_gids):
                 entry = self._gallery[gid]
                 
-                # --- FIX 3: Immune to Queue Lag ---
+                # Immune to Queue Lag
                 if cam_id in entry.active_local_ids and entry.active_local_ids[cam_id] != local_id:
-                    # Use absolute difference between stream timestamps!
                     time_diff = abs(data['timestamp'] - entry.last_cam_update.get(cam_id, 0))
                     if time_diff < 1.5:
-                        continue # They are both in the frame at the same time. Cost stays 1000.0.
+                        continue 
 
                 cost, spatial_dist = self._calculate_sota_probabilistic_cost(data, entry)
                 if cost == float('inf'):
@@ -198,7 +213,6 @@ class GlobalMatcher:
 
         return [items[i] for i in range(len(items)) if i not in assigned_rows]
 
-    # ── Upgrade 5: Spatiotemporal Cascade Match for Lost IDs ──
     def _stage_cascade_lost_gallery(self, items):
         still_unmatched = []
         now = time.time()
@@ -218,7 +232,7 @@ class GlobalMatcher:
                 
                 # Cascade 2: Mid term lost (Left room). Purely visual, strict threshold
                 elif time_lost <= self.lost_mid_sec:
-                    if sim > 0.80 and sim > best_sim:  # Stricter visual requirement
+                    if sim > 0.80 and sim > best_sim:  
                         best_sim, best_gid = sim, gid
 
             if best_gid:
@@ -243,16 +257,15 @@ class GlobalMatcher:
                 if gids[j] in merged: continue
                 
                 entry_a, entry_b = self._gallery[gids[i]], self._gallery[gids[j]]
-                if entry_a.cam_history == entry_b.cam_history: continue # Don't merge same-cam
+                if entry_a.cam_history == entry_b.cam_history: continue 
                 
-                # --- FIX 4: Dedup Queue Lag Fix ---
+                # Dedup Queue Lag Fix
                 conflict = False
                 shared_cams = set(entry_a.active_local_ids.keys()).intersection(set(entry_b.active_local_ids.keys()))
                 for cam in shared_cams:
                     if entry_a.active_local_ids[cam] != entry_b.active_local_ids[cam]:
-                        # Are they alive at the same time? Use absolute stream timestamps!
                         time_diff = abs(entry_a.last_cam_update[cam] - entry_b.last_cam_update[cam])
-                        if time_diff < 2.0: # 2.0 seconds window for extra safety
+                        if time_diff < 2.0: 
                             conflict = True
                             break
                 if conflict: continue
@@ -278,29 +291,39 @@ class GlobalMatcher:
         
         self._gallery[gid] = GalleryEntry(
             gid, 
-            data['local_track_id'], # <--- FIX 2: Pass local track id here
+            data['local_track_id'], 
             data['features_norm'], 
             data['timestamp'], 
             data['world_x'], 
             data['world_y'], 
             data['cam_id'], 
-            data.get('velocity_x', 0), 
-            data.get('velocity_y', 0)
+            0.0, # Initial velocity X
+            0.0  # Initial velocity Y
         )
         self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = gid
         self.r.hset("global_id_map", f"{data['cam_id']}:{data['local_track_id']}", gid)
         log.info(f"New global_id={gid}")
 
-    def _update_entry(self, gid, data):
+    def _update_entry(self, gid, data, update_features=True):
         e = self._gallery[gid]
-        sim_to_best = self._bank_similarity(e.feature_bank, data['features_norm'])
-        
-        if sim_to_best < 0.90:  
-            e.feature_bank.append(data['features_norm'])
-            if len(e.feature_bank) > 5: e.feature_bank.pop(0)
+
+        if update_features:
+            sim_to_best = self._bank_similarity(e.feature_bank, data['features_norm'])
+            if sim_to_best < 0.90:  
+                e.feature_bank.append(data['features_norm'])
+                if len(e.feature_bank) > 5: e.feature_bank.pop(0)
+
+        # FIX 2: Calculate real-world velocity internally
+        dt = data['timestamp'] - e.last_seen
+        if dt > 0.1: # Only update velocity if enough time passed to measure movement
+            inst_vel_x = (data['world_x'] - e.last_x) / dt
+            inst_vel_y = (data['world_y'] - e.last_y) / dt
+            
+            # Smooth velocity (EMA) to avoid erratic predictions from bounding box jitter
+            e.velocity_x = (e.velocity_x * 0.6) + (inst_vel_x * 0.4)
+            e.velocity_y = (e.velocity_y * 0.6) + (inst_vel_y * 0.4)
 
         e.last_seen, e.last_x, e.last_y = data['timestamp'], data['world_x'], data['world_y']
-        e.velocity_x, e.velocity_y = data.get('velocity_x', 0), data.get('velocity_y', 0)
         e.cam_history.add(data['cam_id'])
         
         # --- MUTUAL EXCLUSIVITY FIX ---

@@ -1,100 +1,99 @@
 import redis
-import json
-import base64
+import msgpack
 import cv2
 import numpy as np
 import time
 import torch
-import torch.nn as nn
+import timm
 from PIL import Image
-from torchvision import transforms
 
-try:
-    from torchreid.utils import FeatureExtractor
-except ImportError:
-    FeatureExtractor = None
-
-class ReIDWorker:
-    INPUT_HW = (256, 128)
+class ModernReIDWorker:
+    # --- MODEL CONFIGURATION ---
+    # Options: "siglip" (Best for lighting/color shifts) or "swin" (Best for occlusions)
+    BACKBONE_TYPE = "siglip" 
+    
+    MODELS = {
+        "siglip": "vit_base_patch16_siglip_224", 
+        "swin": "swin_base_patch4_window7_224"
+    }
 
     def __init__(self):
         self.r = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=None)
+        
+        # Intercepts from SCTWorker, pushes to GlobalMatcher
         self.in_queue = "warehouse:queue:reid"
         self.out_queue = "warehouse:queue:matcher"
+        
+        # Hardware acceleration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        self.tf = transforms.Compose([
-            transforms.Resize(self.INPUT_HW),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ])
-        
-        self.model = self._build_model()
-        self.model.eval().to(self.device)
+        # Build model and dynamic transforms
+        self.model, self.tf, self.embed_dim = self._build_model()
 
     def _build_model(self):
-        if FeatureExtractor is not None:
-            try:
-                print("Attempting to load OSNet model via torchreid...")
-                extractor = FeatureExtractor(
-                    model_name='osnet_x1_0',
-                    model_path='osnet_x1_0_msmt17.pth',
-                    device=str(self.device)
-                )
-                self.backend = "osnet"
-                self._osnet = extractor
-                print("OSNet model loaded successfully.")
-                return extractor.model
-            except Exception as e:
-                print(f"Failed to load torchreid extractor ({e}). Falling back to torchvision ResNet50.")
+        model_name = self.MODELS.get(self.BACKBONE_TYPE, self.MODELS["siglip"])
+        print(f"Loading {self.BACKBONE_TYPE.upper()} backbone: {model_name}...")
         
-        # ResNet50 Fallback (standard torchvision model, output dim 2048)
-        print("Using ResNet50 fallback from torchvision...")
-        self.backend = "resnet50"
-        self._osnet = None
-        from torchvision.models import resnet50, ResNet50_Weights
-        net = resnet50(weights=ResNet50_Weights.DEFAULT)
-        net.fc = nn.Identity() # Remove final fc layer to output raw 2048-dim feature maps
-        return net
+        try:
+            # num_classes=0 strips the classification head, returning raw feature embeddings
+            model = timm.create_model(model_name, pretrained=True, num_classes=0)
+            model.eval().to(self.device)
+            
+            # Dynamically pull the exact normalization, mean/std, and image size required by this specific ViT
+            data_config = timm.data.resolve_model_data_config(model)
+            transforms = timm.data.create_transform(**data_config, is_training=False)
+            
+            # Pass a dummy tensor to determine exact output embedding dimension (e.g., 768 or 1024)
+            dummy_input = torch.randn(1, 3, data_config['input_size'][1], data_config['input_size'][2]).to(self.device)
+            with torch.no_grad():
+                dummy_out = model(dummy_input)
+                embed_dim = dummy_out.shape[1]
+                
+            print(f"Model loaded successfully. Embedding Dimension: {embed_dim}")
+            return model, transforms, embed_dim
+            
+        except Exception as e:
+            print(f"Failed to load ViT model ({e}). Ensure 'timm' is installed.")
+            raise
 
     def extract_features_batch(self, imgs):
-        if not imgs:
+        if not imgs: 
             return []
             
-        pil_imgs = []
-        for img in imgs:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            pil_imgs.append(Image.fromarray(img_rgb))
+        # Convert OpenCV BGR to PIL RGB
+        pil_imgs = [Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in imgs]
         
-        if self.backend == "osnet" and self._osnet is not None:
-            # torchreid FeatureExtractor expects numpy arrays (RGB) or file paths
-            np_imgs_rgb = [cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in imgs]
-            feats = self._osnet(np_imgs_rgb)
-            if isinstance(feats, torch.Tensor):
-                feats = feats.cpu().numpy()
-        else:
-            with torch.no_grad():
-                tensor_imgs = torch.stack([self.tf(pil_img) for pil_img in pil_imgs]).to(self.device)
-                feats = self.model(tensor_imgs).cpu().numpy()
+        with torch.no_grad():
+            # Apply dynamic transforms and stack into a single batch tensor
+            tensor_imgs = torch.stack([self.tf(pil_img) for pil_img in pil_imgs]).to(self.device)
+            
+            # Forward pass through the Transformer
+            feats = self.model(tensor_imgs).cpu().numpy()
                 
-        # L2 Normalize feature vectors
+        # L2 Normalize feature vectors (Critical for cosine similarity matching)
         norms = np.linalg.norm(feats, axis=1, keepdims=True)
-        norms[norms == 0] = 1  # Avoid division by zero
+        norms[norms == 0] = 1  
         feats = feats / norms
         
         return feats
 
+    @staticmethod
+    def _normalize_keys(data):
+        """Convert all msgpack byte-keys to string-keys to prevent key mismatch bugs."""
+        return {
+            (k.decode('utf-8') if isinstance(k, bytes) else k): v
+            for k, v in data.items()
+        }
+
     def _gather_batch(self, max_batch_size, timeout):
         batch = []
-        # Block until at least one item
         res = self.r.blpop(self.in_queue, timeout=1)
-        if not res:
+        if not res: 
             return batch
             
         batch.append(res[1])
-        
         end_time = time.time() + timeout
+        
         while len(batch) < max_batch_size and time.time() < end_time:
             res = self.r.lpop(self.in_queue)
             if res:
@@ -103,8 +102,17 @@ class ReIDWorker:
                 time.sleep(0.01)
         return batch
 
-    def run(self, max_batch_size=16):
-        print(f"Starting Re-ID Worker (Backend: {self.backend}, Device: {self.device}, Batch Size: {max_batch_size})...")
+    def run(self, max_batch_size=32):
+        # A batch size of 32-64 easily clears ViT-Base on an RTX 5090 without stalling
+        print(f"Starting ReID Middleware (Device: {self.device}, Batch Size: {max_batch_size})...")
+        
+        # Signal to the pipeline launcher that the model is loaded and we are ready
+        self.r.set("reid_worker:ready", "1")
+        print("ReID Worker signaled READY to pipeline.")
+        
+        # Create the zero-embedding once, reuse forever
+        zero_embedding = np.zeros(self.embed_dim).tolist()
+        
         while True:
             messages = self._gather_batch(max_batch_size=max_batch_size, timeout=0.05)
             if not messages:
@@ -115,37 +123,39 @@ class ReIDWorker:
             valid_indices = []
             
             for idx, message in enumerate(messages):
-                data = json.loads(message.decode('utf-8'))
-                batch_data.append(data)
+                raw_data = msgpack.unpackb(message, strict_map_key=False)
+                # Normalize ALL keys to strings immediately to kill byte-key bugs
+                data = self._normalize_keys(raw_data)
                 
-                img_data = base64.b64decode(data['image_crop'])
-                np_arr = np.frombuffer(img_data, np.uint8)
-                img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if "image_bytes" in data:
+                    img_data = data.pop("image_bytes") # Remove massive byte array from payload to save Redis memory
+                    np_arr = np.frombuffer(img_data, np.uint8)
+                    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-                if img is not None and img.size > 0:
-                    valid_imgs.append(img)
-                    valid_indices.append(idx)
+                    if img is not None and img.size > 0:
+                        valid_imgs.append(img)
+                        valid_indices.append(idx)
+                        
+                batch_data.append(data)
                     
             if valid_imgs:
                 try:
                     features_batch = self.extract_features_batch(valid_imgs)
                     for i, feat in zip(valid_indices, features_batch):
-                        batch_data[i]['features'] = feat.tolist()
+                        # Global Matcher expects the key strictly as "embedding"
+                        batch_data[i]['embedding'] = feat.tolist()
                 except Exception as e:
                     print(f"Error extracting batch features: {e}")
-                    dim = 512 if self.backend == "osnet" else 2048
                     for i in valid_indices:
-                        batch_data[i]['features'] = np.zeros(dim).tolist()
+                        batch_data[i]['embedding'] = zero_embedding
                         
-            # Fill empty for invalid images and push all
-            dim = 512 if self.backend == "osnet" else 2048
+            # BULLETPROOF: Ensure EVERY payload has an embedding before pushing
             for data in batch_data:
-                if 'features' not in data:
-                    data['features'] = np.zeros(dim).tolist()
+                if "embedding" not in data:
+                    data['embedding'] = zero_embedding
                 
-                del data['image_crop']
-                self.r.rpush(self.out_queue, json.dumps(data))
+                self.r.rpush(self.out_queue, msgpack.packb(data))
 
 if __name__ == "__main__":
-    worker = ReIDWorker()
-    worker.run()
+    worker = ModernReIDWorker()
+    worker.run(max_batch_size=32)
