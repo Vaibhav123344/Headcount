@@ -22,7 +22,7 @@ class ModernReIDWorker:
         
         # Intercepts from SCTWorker, pushes to GlobalMatcher
         self.in_queue = "warehouse:queue:reid"
-        self.out_queue = "warehouse:queue:matcher"
+        self.out_queue = "warehouse:queue:reid_result"
         
         # Hardware acceleration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

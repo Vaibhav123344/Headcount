@@ -3,13 +3,26 @@
     "host": "localhost",
     "port": 6379
   },
+  "layout": {
+    "map_path": "map.png",
+    "pixels_per_meter": 50.0,
+    "zones": [
+      {"name": "Counter", "x1": 600, "y1": 0, "x2": 950, "y2": 200},
+      {"name": "Table Area Left", "x1": 50, "y1": 300, "x2": 350, "y2": 700},
+      {"name": "Table Area Center", "x1": 350, "y1": 350, "x2": 550, "y2": 700},
+      {"name": "Table Area Right", "x1": 550, "y1": 350, "x2": 800, "y2": 650},
+      {"name": "Entrance", "x1": 0, "y1": 700, "x2": 150, "y2": 950}
+    ]
+  },
   "matcher": {
     "time_buffer_ms": 150,
     "max_speed_mps": 5.0,
     "feature_bank_size": 5,
     "lost_short_term_sec": 5.0,
     "lost_mid_term_sec": 60.0,
-    "reid_sim_threshold": 0.60
+    "reid_sim_threshold": 0.60,
+    "spatial_match_radius_m": 4.5,
+    "dedup_spatial_radius_m": 4.5
   },
   "cameras": {
     "cam2": {

@@ -6,6 +6,7 @@ def init_db():
     
     print("Clearing leftover items in queues and mapping tables...")
     r.delete("warehouse:queue:reid")
+    r.delete("warehouse:queue:reid_result")
     r.delete("warehouse:queue:matcher")
     r.delete("global_id_map")
     r.delete("state:gallery")

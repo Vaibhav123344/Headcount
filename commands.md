@@ -36,10 +36,11 @@ python tools/calibrate_with_floorplan.py --image calibration/cam2_frame.jpg --fl
 python tools/calibrate_with_floorplan.py --image calibration/cam3_frame.jpg --floor-plan map.png --output calibration/cam3_matrix.npy
 ```
 
-**Option C: Map Master Camera to 2D BEV Layout (NEW)**
-If you want the final tracking to output coordinates on a 2D floorplan layout instead of relative to Camera 2.
+**Option C: Map Cameras to 2D BEV Layout (NEW REQUIRED FOR BEV TRACKING)**
+If you want the final tracking to output coordinates on the 2D floorplan layout, you must run this for EACH camera.
 ```bash
-python tools/layout_calibrator.py --video videos/cam3.mp4 --layout map.png --matrix1 calibration/cam2_matrix.npy --matrix2 calibration/cam3_matrix.npy
+python tools/layout_calibrator.py --video videos/cam2.mp4 --layout map.png --output calibration/cam2_matrix.npy
+python tools/layout_calibrator.py --video videos/cam3.mp4 --layout map.png --output calibration/cam3_matrix.npy
 ```
 
 ## Step 3: Tune ReID Similarity Threshold (Optional but Recommended)
@@ -71,7 +72,7 @@ Everything is configured. The pipeline reads camera setups and matcher configura
 
 This will automatically:
 1. Initialize the Database mapping structures in Redis
-2. Start the Global Matcher (using your tuned threshold and Bayesian Probabilistic Fusion)
-3. Start the ReID Middleware Worker (runs heavy ViT `timm` models like SigLIP or Swin)
+2. Start the Global Matcher (using BEV layout coordinates and Spatial Priority)
+3. Start the ReID Middleware Worker (only runs on unmatched tracks for fast performance)
 4. Dynamically start Pure-Spatial Object Trackers (`sct_worker.py`) for every camera defined in `config.json`
-5. Launch the Streamlit Live Dashboard in your web browser!
+5. Launch the Streamlit Live Dashboard with Bird's Eye View Map in your web browser!

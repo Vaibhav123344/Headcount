@@ -10,6 +10,8 @@ pkill -f "streamlit run dashboard.py" 2>/dev/null
 sleep 1  # Give them time to die
 
 echo "Starting Database Initialization..."
+redis-cli FLUSHDB > /dev/null 2>&1
+echo "  ✓ Redis cache cleared."
 python workers/init_db.py
 
 if [ "$1" == "--tune" ]; then

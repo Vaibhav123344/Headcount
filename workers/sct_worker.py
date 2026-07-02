@@ -26,8 +26,8 @@ class Kalman2D:
                            [0, 0, 0, 1]]) 
         self.H = np.array([[1, 0, 0, 0],
                            [0, 1, 0, 0]]) 
-        self.R = np.eye(2) * 0.1   
-        self.Q = np.eye(4) * 0.01  
+        self.R = np.eye(2) * 5.0    # High: homography projection is noisy
+        self.Q = np.eye(4) * 0.005  # Low: people move slowly on BEV
         self.initialized = False
 
     def update(self, meas_x, meas_y):
@@ -61,8 +61,8 @@ class SCTWorker:
         self.H = np.load(homography_path)
         self.r = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=None)
         
-        # PUSH to ReID worker first, NOT the matcher, to maintain chronological order
-        self.out_queue = "warehouse:queue:reid" 
+        # We will use two queues: fast path (matcher) and slow path (reid)
+        # self.out_queue is removed
 
         self.model = YOLO(r"/home/yc12214/vaibhav/Headcount/yolo26l-pose.pt")
         self.global_id_cache = {}
@@ -145,7 +145,7 @@ class SCTWorker:
                     
                     foot_x, foot_y, kp_quality = self._extract_foot_point(keypoints, idx, (x1, y1, x2, y2))
                     world_coord = cv2.perspectiveTransform(np.array([[[foot_x, foot_y]]], dtype=np.float32), self.H)
-                    raw_x, raw_y = world_coord[0][0][0] / 100.0, world_coord[0][0][1] / 100.0
+                    raw_x, raw_y = float(world_coord[0][0][0]), float(world_coord[0][0][1]) # Layout pixels directly
                     
                     world_x, world_y, vel_x, vel_y = self.kalman_filters[local_id].update(raw_x, raw_y)
 
@@ -159,13 +159,19 @@ class SCTWorker:
                         "velocity_y": vel_y,
                     }
 
-                    # --- THE QUALITY GATE (Issue 1) ---
+                    # FAST PATH: Push position-only updates directly to matcher every frame
+                    self.r.rpush("warehouse:queue:matcher", msgpack.packb(payload))
+
+                    # SLOW PATH (ReID): Only extract images for UNMATCHED tracks
+                    is_unmatched = self.get_global_id(local_id) is None
+
                     h, w = y2 - y1, x2 - x1
                     good_ar = h / max(w, 1) >= self.NORMAL_AR_LOW
                     good_size = h >= self.MIN_CROP_HEIGHT and w >= self.MIN_CROP_WIDTH
-                    is_full_body = h / float(frame_height) <= 0.7 # Avoid passing massive foreground blobs
+                    is_full_body = h / float(frame_height) <= 0.7 
                     
                     needs_reid = (
+                        is_unmatched and 
                         good_ar and good_size and is_full_body and 
                         confidence >= self.MIN_CONF_FOR_REID and 
                         self.track_frame_count[local_id] % self.REID_INTERVAL == 1
@@ -175,10 +181,9 @@ class SCTWorker:
                         crop = frame[y1:y2, x1:x2]
                         if crop.size > 0:
                             _, img_encoded = cv2.imencode('.jpg', crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                            payload["image_bytes"] = img_encoded.tobytes()
-
-                    # Push all tracks to the pipeline chronologically
-                    self.r.rpush(self.out_queue, msgpack.packb(payload))
+                            reid_payload = payload.copy()
+                            reid_payload["image_bytes"] = img_encoded.tobytes()
+                            self.r.rpush("warehouse:queue:reid", msgpack.packb(reid_payload))
 
                     if self.has_display:
                         gid = self.get_global_id(local_id)
