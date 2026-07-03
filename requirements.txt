@@ -6,6 +6,10 @@ scipy>=1.10.0
 redis==5.0.3
 faiss-cpu==1.8.0
 scikit-learn>=1.3.0
+pillow>=10.0.0
+timm>=0.9.0
+torch>=2.1.0
+msgpack>=1.0.0
 
 # NOTE: You MUST install torchreid manually for OSNet:
 # git clone [https://github.com/KaiyangZhou/deep-person-reid.git](https://github.com/KaiyangZhou/deep-person-reid.git)

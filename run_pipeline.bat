@@ -16,7 +16,7 @@ echo Starting Single Camera Trackers (Pose + Homography)...
 start "Camera 1" cmd /k "cd /d %~dp0 && call .venv\Scripts\activate.bat && python workers\sct_worker.py --cam_id cam1 --source videos\camera2_20260627_103326.mp4 --homography calibration\cam1_matrix.npy && pause"
 start "Camera 2" cmd /k "cd /d %~dp0 && call .venv\Scripts\activate.bat && python workers\sct_worker.py --cam_id cam2 --source videos\camera3_20260627_103325.mp4 --homography calibration\cam2_matrix.npy && pause"
 
-echo Starting Streamlit Dashboard...
-start "Dashboard" cmd /k "cd /d %~dp0 && call .venv\Scripts\activate.bat && streamlit run dashboard.py"
+echo Starting PIL Visualizer...
+start "Visualizer" cmd /k "cd /d %~dp0 && call .venv\Scripts\activate.bat && python visualizer.py"
 
 echo Pipeline is running in separate windows. Close those windows to stop.

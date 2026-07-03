@@ -1,3 +1,4 @@
+import json
 import redis
 import msgpack
 import cv2
@@ -7,15 +8,28 @@ import torch
 import timm
 from PIL import Image
 
+# Let cuDNN pick the fastest kernels for our fixed input size.
+torch.backends.cudnn.benchmark = True
+
 class ModernReIDWorker:
-    # --- MODEL CONFIGURATION ---
-    # Options: "siglip" (Best for lighting/color shifts) or "swin" (Best for occlusions)
-    BACKBONE_TYPE = "siglip" 
-    
+    # ================= MODEL CONFIGURATION — SWITCH HERE =================
+    # Exactly ONE of the next two lines must be active.
+    #
+    #   siglip = current default (generic ViT, robust to lighting/color).
+    #   osnet  = person-ReID model (MSMT17), more discriminative + faster.
+    #            After switching to osnet you MUST re-run tools/redis_reid_tuner.py
+    #            and update reid_sim_threshold in config.json (scale differs!).
+    #
+    # To use OSNet:  COMMENT the siglip line, UNCOMMENT the osnet line.
+    #BACKBONE_TYPE = "siglip"
+    BACKBONE_TYPE = "osnet"
+    # ====================================================================
+
     MODELS = {
-        "siglip": "vit_base_patch16_siglip_224", 
+        "siglip": "vit_base_patch16_siglip_224",
         "swin": "swin_base_patch4_window7_224"
     }
+    OSNET_WEIGHTS = "osnet_x1_0_msmt17.pth"
 
     def __init__(self):
         self.r = redis.Redis(host='localhost', port=6379, db=0, socket_timeout=None)
@@ -26,11 +40,21 @@ class ModernReIDWorker:
         
         # Hardware acceleration
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        self.use_fp16 = self.device.type == "cuda"
+
+        # Drop crops that arrived too late to be worth embedding (backlog guard).
+        try:
+            self.stale_reid_sec = json.load(open("config.json")).get("matcher", {}).get("stale_reid_sec", 3.0)
+        except Exception:
+            self.stale_reid_sec = 3.0
+
         # Build model and dynamic transforms
         self.model, self.tf, self.embed_dim = self._build_model()
 
     def _build_model(self):
+        if self.BACKBONE_TYPE == "osnet":
+            return self._build_osnet()
+
         model_name = self.MODELS.get(self.BACKBONE_TYPE, self.MODELS["siglip"])
         print(f"Loading {self.BACKBONE_TYPE.upper()} backbone: {model_name}...")
         
@@ -56,6 +80,23 @@ class ModernReIDWorker:
             print(f"Failed to load ViT model ({e}). Ensure 'timm' is installed.")
             raise
 
+    def _build_osnet(self):
+        """Person-ReID backbone: OSNet x1.0 (MSMT17). 512-d features, 256x128 input."""
+        import torchreid
+        from torchvision import transforms as T
+        print(f"Loading OSNET backbone: osnet_x1_0 ({self.OSNET_WEIGHTS})...")
+        model = torchreid.models.build_model("osnet_x1_0", num_classes=1000, pretrained=False)
+        torchreid.utils.load_pretrained_weights(model, self.OSNET_WEIGHTS)
+        model.eval().to(self.device)  # eval() mode: forward returns 512-d features, not logits
+        tf = T.Compose([
+            T.Resize((256, 128)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        embed_dim = 512
+        print(f"OSNet loaded successfully. Embedding Dimension: {embed_dim}")
+        return model, tf, embed_dim
+
     def extract_features_batch(self, imgs):
         if not imgs: 
             return []
@@ -63,13 +104,19 @@ class ModernReIDWorker:
         # Convert OpenCV BGR to PIL RGB
         pil_imgs = [Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in imgs]
         
-        with torch.no_grad():
+        with torch.inference_mode():
             # Apply dynamic transforms and stack into a single batch tensor
             tensor_imgs = torch.stack([self.tf(pil_img) for pil_img in pil_imgs]).to(self.device)
-            
-            # Forward pass through the Transformer
-            feats = self.model(tensor_imgs).cpu().numpy()
-                
+
+            # Forward pass through the Transformer (fp16 autocast on GPU for ~2x speed;
+            # weights stay fp32, output cast back to fp32 before normalize).
+            if self.use_fp16:
+                with torch.autocast("cuda", dtype=torch.float16):
+                    feats = self.model(tensor_imgs)
+                feats = feats.float().cpu().numpy()
+            else:
+                feats = self.model(tensor_imgs).cpu().numpy()
+
         # L2 Normalize feature vectors (Critical for cosine similarity matching)
         norms = np.linalg.norm(feats, axis=1, keepdims=True)
         norms[norms == 0] = 1  
@@ -122,11 +169,16 @@ class ModernReIDWorker:
             valid_imgs = []
             valid_indices = []
             
+            now = time.time()
             for idx, message in enumerate(messages):
                 raw_data = msgpack.unpackb(message, strict_map_key=False)
                 # Normalize ALL keys to strings immediately to kill byte-key bugs
                 data = self._normalize_keys(raw_data)
-                
+
+                # Backlog guard: skip crops too old to matter (don't waste ViT compute).
+                if self.stale_reid_sec > 0 and 'timestamp' in data and (now - data['timestamp']) > self.stale_reid_sec:
+                    continue
+
                 if "image_bytes" in data:
                     img_data = data.pop("image_bytes") # Remove massive byte array from payload to save Redis memory
                     np_arr = np.frombuffer(img_data, np.uint8)

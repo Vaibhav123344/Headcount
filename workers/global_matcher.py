@@ -43,8 +43,12 @@ class GlobalMatcher:
         self.lost_short_sec     = m_cfg['lost_short_term_sec']
         self.lost_mid_sec       = m_cfg['lost_mid_term_sec']
         self.reid_sim_threshold = m_cfg.get('reid_sim_threshold', 0.60)
-        self.spatial_match_radius_m = m_cfg.get('spatial_match_radius_m', 2.0)
+        self.spatial_match_radius_m = m_cfg.get('spatial_match_radius_m', 4.0)
         self.dedup_spatial_radius_m = m_cfg.get('dedup_spatial_radius_m', 2.0)
+        self.feature_bank_size  = m_cfg.get('feature_bank_size', 5)
+        self.recover_radius_m   = m_cfg.get('recover_radius_m', 3.0)
+        self.stale_position_sec = m_cfg.get('stale_position_sec', 1.0)
+        self.stale_reid_sec     = m_cfg.get('stale_reid_sec', 3.0)
         
         l_cfg = self.cfg.get('layout', {})
         self.pixels_per_meter = l_cfg.get('pixels_per_meter', 50.0)
@@ -56,10 +60,27 @@ class GlobalMatcher:
         self._next_id = 1
         self._jitter_buffer = []  
 
+    @staticmethod
+    def _point_in_poly(x, y, pts):
+        inside = False
+        n = len(pts)
+        j = n - 1
+        for i in range(n):
+            xi, yi = pts[i]
+            xj, yj = pts[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi):
+                inside = not inside
+            j = i
+        return inside
+
     def _get_zone(self, x, y):
         for z in self.zones:
-            if z['x1'] <= x <= z['x2'] and z['y1'] <= y <= z['y2']:
-                return z['name']
+            if 'points' in z:
+                if self._point_in_poly(x, y, z['points']):
+                    return z['name']
+            elif 'x1' in z:  # legacy rectangle format
+                if z['x1'] <= x <= z['x2'] and z['y1'] <= y <= z['y2']:
+                    return z['name']
         return "Unknown"
 
     @staticmethod
@@ -69,12 +90,27 @@ class GlobalMatcher:
             for k, v in data.items()
         }
 
+    def _drain(self, queue):
+        """Atomically pull ALL items from a Redis list in one round-trip.
+
+        LRANGE + DEL run inside a MULTI/EXEC transaction, so items pushed
+        after the snapshot survive for the next drain (nothing is lost).
+        Replaces slow per-item lpop loops.
+        """
+        pipe = self.r.pipeline()  # transaction=True by default
+        pipe.lrange(queue, 0, -1)
+        pipe.delete(queue)
+        items, _ = pipe.execute()
+        return items
+
     def _poll_reid_results(self):
-        """Poll warehouse:queue:reid_result to update feature banks."""
-        while True:
-            res = self.r.lpop(self.reid_queue)
-            if not res: break
+        """Drain warehouse:queue:reid_result to update feature banks; skip stale embeddings."""
+        now = time.time()
+        for res in self._drain(self.reid_queue):
             data = self._normalize_keys(msgpack.unpackb(res, strict_map_key=False))
+            # Drop embeddings that arrived too late to be trusted for this track's pose.
+            if self.stale_reid_sec > 0 and 'timestamp' in data and (now - data['timestamp']) > self.stale_reid_sec:
+                continue
             key = (data['cam_id'], int(data['local_track_id']))
             if key in self._cam_local_to_global:
                 gid = self._cam_local_to_global[key]
@@ -84,15 +120,13 @@ class GlobalMatcher:
                     if norm > 0.01:
                         emb = emb / norm
                         self._gallery[gid].feature_bank.append(emb)
-                        if len(self._gallery[gid].feature_bank) > 5:
+                        if len(self._gallery[gid].feature_bank) > self.feature_bank_size:
                             self._gallery[gid].feature_bank.pop(0)
 
     def _gather_and_align_windows(self):
-        while True:
-            res = self.r.lpop(self.in_queue)
-            if not res: break
+        for res in self._drain(self.in_queue):
             self._jitter_buffer.append(self._normalize_keys(msgpack.unpackb(res, strict_map_key=False)))
-        
+
         if not self._jitter_buffer:
             res = self.r.blpop(self.in_queue, timeout=1)
             if res: self._jitter_buffer.append(self._normalize_keys(msgpack.unpackb(res[1], strict_map_key=False)))
@@ -102,6 +136,17 @@ class GlobalMatcher:
 
         self._jitter_buffer.sort(key=lambda x: x['timestamp'])
         latest_stream_time = self._jitter_buffer[-1]['timestamp']
+
+        # Self-healing latency guard: if we ever fall far behind, discard ancient
+        # backlog positions so we always process near-live data (never live data).
+        if self.stale_position_sec > 0:
+            cutoff = latest_stream_time - self.stale_position_sec
+            before = len(self._jitter_buffer)
+            self._jitter_buffer = [d for d in self._jitter_buffer if d['timestamp'] >= cutoff]
+            dropped = before - len(self._jitter_buffer)
+            if dropped:
+                log.warning(f"Dropped {dropped} stale positions (>{self.stale_position_sec}s behind); matcher was backlogged")
+
         ready_windows = []
 
         while self._jitter_buffer and (latest_stream_time - self._jitter_buffer[0]['timestamp'] >= self.time_buffer_sec):
@@ -190,16 +235,16 @@ class GlobalMatcher:
                 # Reject impossible physics unless they are fundamentally close enough for calibration error
                 if req_speed > self.max_speed_mps and dist > 2.0:
                     continue
-                    
-                # Strict distance limit (4.0m) to prevent random jumping
-                if dist <= 4.0:
+
+                # Strict distance limit to prevent random jumping
+                if dist <= self.spatial_match_radius_m:
                     cost_matrix[i, j] = dist
 
         row_inds, col_inds = linear_sum_assignment(cost_matrix)
         assigned_rows = set()
-        
+
         for row, col in zip(row_inds, col_inds):
-            if cost_matrix[row, col] <= 4.0:
+            if cost_matrix[row, col] <= self.spatial_match_radius_m:
                 data, gid = items[row], gallery_gids[col]
                 self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = gid
                 self._update_entry(gid, data)
@@ -220,23 +265,18 @@ class GlobalMatcher:
 
             for gid, entry in self._lost_gallery.items():
                 dist = self._distance_m(world_x, world_y, entry.last_x, entry.last_y)
-                
-                # Must be within reasonable distance (3m) to recover
-                if dist > 3.0:
+
+                # Must be within reasonable distance to recover.
+                # Recovery is spatial-only: the fresh local track has no feature bank yet,
+                # and fast-path payloads carry no embedding (ReID arrives async, later).
+                if dist > self.recover_radius_m:
                     continue
 
-                # If we have ReID features, use them to boost confidence
-                score = dist
-                if entry.feature_bank and 'features_norm' in data:
-                    sim = self._bank_similarity(entry.feature_bank, data['features_norm'])
-                    if sim > 0.4:
-                        score = dist * (1.0 - sim)  # Lower score = better match
-
-                if score < best_score:
-                    best_score = score
+                if dist < best_score:
+                    best_score = dist
                     best_gid = gid
 
-            if best_gid is not None and best_score < 3.0:
+            if best_gid is not None and best_score < self.recover_radius_m:
                 # Recover from lost gallery
                 recovered = self._lost_gallery.pop(best_gid)
                 recovered.last_seen = data['timestamp']
@@ -329,7 +369,7 @@ class GlobalMatcher:
                     ea_keep, ea_drop = self._gallery[keep], self._gallery[drop]
                     
                     ea_keep.feature_bank.extend(ea_drop.feature_bank)
-                    ea_keep.feature_bank = ea_keep.feature_bank[-5:]
+                    ea_keep.feature_bank = ea_keep.feature_bank[-self.feature_bank_size:]
                     ea_keep.cam_history.update(ea_drop.cam_history)
                     
                     for cam_id, lid in ea_drop.active_local_ids.items():

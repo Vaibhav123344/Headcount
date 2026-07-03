@@ -6,7 +6,7 @@ echo "Cleaning up leftover processes from previous runs..."
 pkill -f "workers/sct_worker.py" 2>/dev/null
 pkill -f "workers/reid_worker.py" 2>/dev/null
 pkill -f "workers/global_matcher.py" 2>/dev/null
-pkill -f "streamlit run dashboard.py" 2>/dev/null
+pkill -f "visualizer.py" 2>/dev/null
 sleep 1  # Give them time to die
 
 echo "Starting Database Initialization..."
@@ -58,12 +58,12 @@ for cid, cinfo in cfg.get("cameras", {}).items():
     os.system(cmd)
 '
 
-echo "Starting Streamlit Dashboard..."
-python -m streamlit run dashboard.py --server.headless true &
+echo "Starting PIL Visualizer (writes live_view.png; opens window if DISPLAY set)..."
+python visualizer.py &
 
 echo "Pipeline is running. Press Ctrl+C to stop."
 
 # Trap Ctrl+C to kill all child processes cleanly
-trap "echo '  Stopping all workers...'; pkill -P $$; pkill -f 'workers/sct_worker.py'; pkill -f 'workers/reid_worker.py'; pkill -f 'workers/global_matcher.py'; pkill -f 'streamlit run dashboard.py'; exit 0" SIGINT SIGTERM
+trap "echo '  Stopping all workers...'; pkill -P $$; pkill -f 'workers/sct_worker.py'; pkill -f 'workers/reid_worker.py'; pkill -f 'workers/global_matcher.py'; pkill -f 'visualizer.py'; exit 0" SIGINT SIGTERM
 
 wait

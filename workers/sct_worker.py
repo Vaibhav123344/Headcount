@@ -30,17 +30,20 @@ class Kalman2D:
         self.Q = np.eye(4) * 0.005  # Low: people move slowly on BEV
         self.initialized = False
 
-    def update(self, meas_x, meas_y):
+    def update(self, meas_x, meas_y, meas_noise=None):
         z = np.array([[meas_x], [meas_y]])
         if not self.initialized:
             self.x = np.array([[meas_x], [meas_y], [0], [0]])
             self.initialized = True
             return meas_x, meas_y, 0, 0
 
+        # Dynamic measurement noise: trust clean ankle points, distrust fallbacks.
+        R = self.R if meas_noise is None else np.eye(2) * meas_noise
+
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
         y = z - (self.H @ self.x)
-        S = self.H @ self.P @ self.H.T + self.R
+        S = self.H @ self.P @ self.H.T + R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + (K @ y)
         self.P = (np.eye(4) - K @ self.H) @ self.P
@@ -54,6 +57,9 @@ class SCTWorker:
     ANKLE_CONF_THRESH = 0.3
     NORMAL_AR_LOW     = 1.5
     REID_INTERVAL     = 10
+    REID_REFRESH_INTERVAL = 60  # Re-ReID already-matched tracks to keep feature bank fresh
+    # Kalman measurement noise per foot-point quality (higher = trust less)
+    NOISE_BY_QUALITY  = {'ankle': 5.0, 'knee': 8.0, 'bbox': 20.0}
 
     def __init__(self, cam_id, source, homography_path):
         self.cam_id = cam_id
@@ -63,6 +69,13 @@ class SCTWorker:
         
         # We will use two queues: fast path (matcher) and slow path (reid)
         # self.out_queue is removed
+
+        # Bound the slow-path ReID queue so crop bursts can't flood Redis / go stale.
+        try:
+            import json as _json
+            self.reid_queue_max = _json.load(open("config.json")).get("matcher", {}).get("reid_queue_max", 300)
+        except Exception:
+            self.reid_queue_max = 300
 
         self.model = YOLO(r"/home/yc12214/vaibhav/Headcount/yolo26l-pose.pt")
         self.global_id_cache = {}
@@ -88,18 +101,18 @@ class SCTWorker:
     def _extract_foot_point(keypoints_data, idx, box):
         x1, y1, x2, y2 = box
         fallback_x, fallback_y = (x1 + x2) / 2.0, float(y2)
-        if keypoints_data is None: return fallback_x, fallback_y, 'low'
-        
+        if keypoints_data is None: return fallback_x, fallback_y, 'bbox'
+
         kpts = keypoints_data.data.cpu().numpy()
-        if idx >= len(kpts): return fallback_x, fallback_y, 'low'
+        if idx >= len(kpts): return fallback_x, fallback_y, 'bbox'
         person_kpts = kpts[idx]
-        
+
         visible_ankles = [kp[:2] for kp in person_kpts[15:17] if kp[2] > SCTWorker.ANKLE_CONF_THRESH]
-        if visible_ankles: return float(np.mean(visible_ankles, axis=0)[0]), float(np.mean(visible_ankles, axis=0)[1]), 'high'
+        if visible_ankles: return float(np.mean(visible_ankles, axis=0)[0]), float(np.mean(visible_ankles, axis=0)[1]), 'ankle'
         visible_knees = [kp[:2] for kp in person_kpts[13:15] if kp[2] > SCTWorker.ANKLE_CONF_THRESH]
-        if visible_knees: return float(np.mean(visible_knees, axis=0)[0]), float(np.mean(visible_knees, axis=0)[1]), 'high'
-        
-        return fallback_x, fallback_y, 'low'
+        if visible_knees: return float(np.mean(visible_knees, axis=0)[0]), float(np.mean(visible_knees, axis=0)[1]), 'knee'
+
+        return fallback_x, fallback_y, 'bbox'
 
     def run(self):
         print(f"[{self.cam_id}] Starting Pure-Spatial SCT Worker...")
@@ -123,7 +136,7 @@ class SCTWorker:
             current_time = time.time() 
             self.update_global_id_cache()
 
-            results = self.model.track(frame, persist=True, tracker="botsort.yaml", conf=0.35, iou=0.5, classes=[0], verbose=False)
+            results = self.model.track(frame, persist=True, tracker="botsort.yaml", conf=0.20, iou=0.65, imgsz=1024, classes=[0], verbose=False)
 
             if results[0].boxes.id is not None:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -146,8 +159,9 @@ class SCTWorker:
                     foot_x, foot_y, kp_quality = self._extract_foot_point(keypoints, idx, (x1, y1, x2, y2))
                     world_coord = cv2.perspectiveTransform(np.array([[[foot_x, foot_y]]], dtype=np.float32), self.H)
                     raw_x, raw_y = float(world_coord[0][0][0]), float(world_coord[0][0][1]) # Layout pixels directly
-                    
-                    world_x, world_y, vel_x, vel_y = self.kalman_filters[local_id].update(raw_x, raw_y)
+
+                    meas_noise = self.NOISE_BY_QUALITY.get(kp_quality, 5.0)
+                    world_x, world_y, vel_x, vel_y = self.kalman_filters[local_id].update(raw_x, raw_y, meas_noise)
 
                     payload = {
                         "cam_id": self.cam_id,
@@ -162,20 +176,22 @@ class SCTWorker:
                     # FAST PATH: Push position-only updates directly to matcher every frame
                     self.r.rpush("warehouse:queue:matcher", msgpack.packb(payload))
 
-                    # SLOW PATH (ReID): Only extract images for UNMATCHED tracks
+                    # SLOW PATH (ReID): extract crops for UNMATCHED tracks (fast), plus
+                    # a slow periodic refresh for MATCHED tracks so feature banks don't go stale.
                     is_unmatched = self.get_global_id(local_id) is None
 
                     h, w = y2 - y1, x2 - x1
                     good_ar = h / max(w, 1) >= self.NORMAL_AR_LOW
                     good_size = h >= self.MIN_CROP_HEIGHT and w >= self.MIN_CROP_WIDTH
-                    is_full_body = h / float(frame_height) <= 0.7 
-                    
-                    needs_reid = (
-                        is_unmatched and 
-                        good_ar and good_size and is_full_body and 
-                        confidence >= self.MIN_CONF_FOR_REID and 
-                        self.track_frame_count[local_id] % self.REID_INTERVAL == 1
-                    )
+                    is_full_body = h / float(frame_height) <= 0.7
+                    good_crop = good_ar and good_size and is_full_body and confidence >= self.MIN_CONF_FOR_REID
+
+                    fcount = self.track_frame_count[local_id]
+                    if is_unmatched:
+                        due = fcount % self.REID_INTERVAL == 1
+                    else:
+                        due = fcount % self.REID_REFRESH_INTERVAL == 1
+                    needs_reid = good_crop and due
 
                     if needs_reid:
                         crop = frame[y1:y2, x1:x2]
@@ -183,7 +199,12 @@ class SCTWorker:
                             _, img_encoded = cv2.imencode('.jpg', crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                             reid_payload = payload.copy()
                             reid_payload["image_bytes"] = img_encoded.tobytes()
-                            self.r.rpush("warehouse:queue:reid", msgpack.packb(reid_payload))
+                            # Push then cap: keep only the newest N crops so a burst of
+                            # new tracks can't back up the ViT with stale images.
+                            pipe = self.r.pipeline(transaction=False)
+                            pipe.rpush("warehouse:queue:reid", msgpack.packb(reid_payload))
+                            pipe.ltrim("warehouse:queue:reid", -self.reid_queue_max, -1)
+                            pipe.execute()
 
                     if self.has_display:
                         gid = self.get_global_id(local_id)
