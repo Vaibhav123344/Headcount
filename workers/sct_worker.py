@@ -136,7 +136,7 @@ class SCTWorker:
             current_time = time.time() 
             self.update_global_id_cache()
 
-            results = self.model.track(frame, persist=True, tracker="botsort.yaml", conf=0.20, iou=0.65, imgsz=1024, classes=[0], verbose=False)
+            results = self.model.track(frame, persist=True, tracker="botsort.yaml", conf=0.3, iou=0.5, classes=[0], imgsz=1024 ,verbose=False)
 
             if results[0].boxes.id is not None:
                 boxes = results[0].boxes.xyxy.cpu().numpy()

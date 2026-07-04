@@ -4,7 +4,7 @@
     "port": 6379
   },
   "layout": {
-    "map_path": "map.png",
+    "map_path": "best_layout_till_now.png",
     "pixels_per_meter": 50.0,
     "zones": [
       {
@@ -116,11 +116,11 @@
   },
   "cameras": {
     "cam2": {
-      "video_path": "videos/cam2_old.mp4",
+      "video_path": "videos/cam4.mp4",
       "matrix_path": "calibration/cam2_matrix.npy"
     },
     "cam3": {
-      "video_path": "videos/cam3_old.mp4",
+      "video_path": "videos/cam5.mp4",
       "matrix_path": "calibration/cam3_matrix.npy"
     }
   }
