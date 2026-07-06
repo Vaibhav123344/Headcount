@@ -60,6 +60,10 @@ class SCTWorker:
     REID_REFRESH_INTERVAL = 60  # Re-ReID already-matched tracks to keep feature bank fresh
     # Kalman measurement noise per foot-point quality (higher = trust less)
     NOISE_BY_QUALITY  = {'ankle': 5.0, 'knee': 8.0, 'bbox': 20.0}
+    # Distance-based confidence: homography error grows with range from the camera.
+    # Inflate measurement noise the farther the projected point is from cam_position.
+    DIST_NOISE_REF_M    = 8.0    # +100% noise per 8 m from camera
+    MAX_DIST_NOISE_MULT = 6.0    # cap so distant points aren't fully ignored
 
     def __init__(self, cam_id, source, homography_path):
         self.cam_id = cam_id
@@ -71,11 +75,21 @@ class SCTWorker:
         # self.out_queue is removed
 
         # Bound the slow-path ReID queue so crop bursts can't flood Redis / go stale.
+        # Also load this camera's map position (optional) for distance-based confidence.
         try:
             import json as _json
-            self.reid_queue_max = _json.load(open("config.json")).get("matcher", {}).get("reid_queue_max", 300)
+            _cfg = _json.load(open("config.json"))
+            self.reid_queue_max   = _cfg.get("matcher", {}).get("reid_queue_max", 300)
+            self.pixels_per_meter = _cfg.get("layout", {}).get("pixels_per_meter", 50.0)
+            cp = _cfg.get("cameras", {}).get(cam_id, {}).get("cam_position")
+            # cam_position = [x, y] in map.png pixels; None -> distance weighting off.
+            self.cam_pos = (float(cp[0]), float(cp[1])) if cp else None
         except Exception:
-            self.reid_queue_max = 300
+            self.reid_queue_max   = 300
+            self.pixels_per_meter = 50.0
+            self.cam_pos = None
+        if self.cam_pos:
+            print(f"[{cam_id}] Distance-based confidence ON (cam at {self.cam_pos} on map).")
 
         self.model = YOLO(r"/home/yc12214/vaibhav/Headcount/yolo26l-pose.pt")
         self.global_id_cache = {}
@@ -161,6 +175,10 @@ class SCTWorker:
                     raw_x, raw_y = float(world_coord[0][0][0]), float(world_coord[0][0][1]) # Layout pixels directly
 
                     meas_noise = self.NOISE_BY_QUALITY.get(kp_quality, 5.0)
+                    # Trust points near the camera more than far ones (perspective stretch).
+                    if self.cam_pos is not None:
+                        dist_m = float(np.hypot(raw_x - self.cam_pos[0], raw_y - self.cam_pos[1])) / self.pixels_per_meter
+                        meas_noise *= min(self.MAX_DIST_NOISE_MULT, 1.0 + dist_m / self.DIST_NOISE_REF_M)
                     world_x, world_y, vel_x, vel_y = self.kalman_filters[local_id].update(raw_x, raw_y, meas_noise)
 
                     payload = {

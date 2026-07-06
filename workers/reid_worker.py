@@ -21,8 +21,8 @@ class ModernReIDWorker:
     #            and update reid_sim_threshold in config.json (scale differs!).
     #
     # To use OSNet:  COMMENT the siglip line, UNCOMMENT the osnet line.
-    #BACKBONE_TYPE = "siglip"
-    BACKBONE_TYPE = "osnet"
+    BACKBONE_TYPE = "siglip"
+    #BACKBONE_TYPE = "osnet"
     # ====================================================================
 
     MODELS = {

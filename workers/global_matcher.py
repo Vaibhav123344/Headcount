@@ -25,8 +25,15 @@ class GalleryEntry:
         self.velocity_y  = 0.0
         self.cam_history = {cam_id}
         self.zone = zone
-        
-        self.active_local_ids = {cam_id: int(local_id)} 
+
+        # Confirmation gating: a fresh track is "tentative" and NOT counted until it
+        # survives `confirm_hits` position updates. This lets cross-camera dedup merge
+        # duplicates (person seen by 2 cams) BEFORE either copy is ever counted, and
+        # discards 1-2 frame ghost detections. Kills the main headcount fluctuation.
+        self.hits = 1
+        self.confirmed = False
+
+        self.active_local_ids = {cam_id: int(local_id)}
         self.last_cam_update = {cam_id: timestamp}
 
 class GlobalMatcher:
@@ -49,6 +56,9 @@ class GlobalMatcher:
         self.recover_radius_m   = m_cfg.get('recover_radius_m', 3.0)
         self.stale_position_sec = m_cfg.get('stale_position_sec', 1.0)
         self.stale_reid_sec     = m_cfg.get('stale_reid_sec', 3.0)
+        # Headcount stability knobs.
+        self.confirm_hits       = m_cfg.get('confirm_hits', 3)      # updates before a track is counted
+        self.count_hold_sec     = m_cfg.get('count_hold_sec', 3.0)  # keep counting after last_seen this long
         
         l_cfg = self.cfg.get('layout', {})
         self.pixels_per_meter = l_cfg.get('pixels_per_meter', 50.0)
@@ -119,9 +129,53 @@ class GlobalMatcher:
                     norm = np.linalg.norm(emb)
                     if norm > 0.01:
                         emb = emb / norm
+                        
+                        # Feature Bank Poisoning Protection
+                        current_bank = self._gallery[gid].feature_bank
+                        if len(current_bank) > 0:
+                            sim = self._bank_similarity([emb], current_bank)
+                            if sim < (self.reid_sim_threshold - 0.20): 
+                                log.warning(f"Dropped poisoned ReID crop for {gid} (sim={sim:.2f})")
+                                continue
+                                
                         self._gallery[gid].feature_bank.append(emb)
                         if len(self._gallery[gid].feature_bank) > self.feature_bank_size:
                             self._gallery[gid].feature_bank.pop(0)
+
+                        # Async ReID-based Lost Recovery for newly minted tracks
+                        entry = self._gallery[gid]
+                        if entry.hits < 30 and self._lost_gallery:
+                            best_lost_gid = None
+                            best_sim = 0.0
+                            
+                            for lost_gid, lost_entry in self._lost_gallery.items():
+                                if len(lost_entry.feature_bank) > 0:
+                                    sim = self._bank_similarity([emb], lost_entry.feature_bank)
+                                    if sim > best_sim:
+                                        best_sim = sim
+                                        best_lost_gid = lost_gid
+                                        
+                            if best_lost_gid and best_sim > (self.reid_sim_threshold + 0.10):
+                                log.info(f"ReID RECOVERY: Track {gid} is actually lost {best_lost_gid} (sim={best_sim:.2f})")
+                                
+                                lost_entry = self._lost_gallery.pop(best_lost_gid)
+                                lost_entry.last_seen = entry.last_seen
+                                lost_entry.last_x = entry.last_x
+                                lost_entry.last_y = entry.last_y
+                                lost_entry.velocity_x = entry.velocity_x
+                                lost_entry.velocity_y = entry.velocity_y
+                                lost_entry.active_local_ids = entry.active_local_ids
+                                lost_entry.last_cam_update = entry.last_cam_update
+                                lost_entry.cam_history.update(entry.cam_history)
+                                lost_entry.feature_bank.append(emb)
+                                
+                                self._gallery[best_lost_gid] = lost_entry
+                                del self._gallery[gid]
+                                
+                                for k, v in list(self._cam_local_to_global.items()):
+                                    if v == gid:
+                                        self._cam_local_to_global[k] = best_lost_gid
+                                        self.r.hset("global_id_map", f"{k[0]}:{k[1]}", best_lost_gid)
 
     def _gather_and_align_windows(self):
         for res in self._drain(self.in_queue):
@@ -236,9 +290,17 @@ class GlobalMatcher:
                 if req_speed > self.max_speed_mps and dist > 2.0:
                     continue
 
+                # Calculate expected position based on velocity
+                expected_x = entry.last_x + (entry.velocity_x * dt)
+                expected_y = entry.last_y + (entry.velocity_y * dt)
+                dist_to_expected = self._distance_m(world_x, world_y, expected_x, expected_y)
+                
+                # Blended cost (70% actual distance, 30% expected trajectory)
+                blended_cost = (dist * 0.7) + (dist_to_expected * 0.3)
+
                 # Strict distance limit to prevent random jumping
                 if dist <= self.spatial_match_radius_m:
-                    cost_matrix[i, j] = dist
+                    cost_matrix[i, j] = blended_cost
 
         row_inds, col_inds = linear_sum_assignment(cost_matrix)
         assigned_rows = set()
@@ -286,6 +348,7 @@ class GlobalMatcher:
                 recovered.active_local_ids[data['cam_id']] = int(data['local_track_id'])
                 recovered.last_cam_update[data['cam_id']] = data['timestamp']
                 recovered.zone = self._get_zone(data['world_x'], data['world_y'])
+                recovered.hits += 1  # already-known person keeps confirmed state on recovery
 
                 self._gallery[best_gid] = recovered
                 self._cam_local_to_global[(data['cam_id'], int(data['local_track_id']))] = best_gid
@@ -352,8 +415,12 @@ class GlobalMatcher:
                                 cost_matrix[i, j] = dist * (1.0 - sim)
                             elif sim >= 0.40:
                                 cost_matrix[i, j] = dist
+                            else:
+                                continue # They look different, reject merge
                         else:
-                            cost_matrix[i, j] = dist
+                            # No ReID yet. Only merge if extremely close.
+                            if dist <= 1.0:
+                                cost_matrix[i, j] = dist
                 
                 row_inds, col_inds = linear_sum_assignment(cost_matrix)
                 
@@ -371,6 +438,9 @@ class GlobalMatcher:
                     ea_keep.feature_bank.extend(ea_drop.feature_bank)
                     ea_keep.feature_bank = ea_keep.feature_bank[-self.feature_bank_size:]
                     ea_keep.cam_history.update(ea_drop.cam_history)
+                    # Inherit confirmation so a merge never demotes a counted person.
+                    ea_keep.confirmed = ea_keep.confirmed or ea_drop.confirmed
+                    ea_keep.hits = max(ea_keep.hits, ea_drop.hits)
                     
                     for cam_id, lid in ea_drop.active_local_ids.items():
                         if cam_id not in ea_keep.active_local_ids:
@@ -417,7 +487,11 @@ class GlobalMatcher:
         e.last_seen, e.last_x, e.last_y = data['timestamp'], data['world_x'], data['world_y']
         e.cam_history.add(data['cam_id'])
         e.zone = self._get_zone(data['world_x'], data['world_y'])
-        
+
+        e.hits += 1
+        if e.hits >= self.confirm_hits:
+            e.confirmed = True
+
         e.active_local_ids[data['cam_id']] = int(data['local_track_id'])
         e.last_cam_update[data['cam_id']] = data['timestamp']
 
@@ -439,6 +513,14 @@ class GlobalMatcher:
                 
                 for gid in [g for g, e in self._lost_gallery.items() if now - e.last_seen > self.lost_mid_sec]:
                     del self._lost_gallery[gid]
+
+                # Prune stale per-camera bindings so a camera that lost this person
+                # long ago can't falsely block re-binding / cross-camera matching later.
+                for e in self._gallery.values():
+                    for c in [c for c, t in e.last_cam_update.items() if now - t > self.lost_short_sec]:
+                        e.active_local_ids.pop(c, None)
+                        e.last_cam_update.pop(c, None)
+                        e.cam_history.discard(c)
                 last_cleanup = now
                 
             windows = self._gather_and_align_windows()
@@ -446,25 +528,33 @@ class GlobalMatcher:
                 self.process_window(window)
                 
             now = time.time()
+            # Count only CONFIRMED tracks that were seen recently. Confirmation drops
+            # ghosts + pre-dedup duplicates; the hold window keeps the count steady
+            # through brief detection gaps instead of flickering frame-to-frame.
+            counted = [
+                e for e in self._gallery.values()
+                if e.confirmed and (now - e.last_seen) <= self.count_hold_sec
+            ]
+
             zone_counts = {z['name']: 0 for z in self.zones}
             zone_counts["Unknown"] = 0
-            for e in self._gallery.values():
+            for e in counted:
                 if e.zone in zone_counts:
                     zone_counts[e.zone] += 1
                 else:
                     zone_counts["Unknown"] += 1
-                    
+
             snapshot = {
-                "unique_people": len(self._gallery),
+                "unique_people": len(counted),
                 "next_id": self._next_id,
                 "entries": [
                     {
-                        "global_id": e.global_id, 
-                        "last_x": round(e.last_x, 2), 
-                        "last_y": round(e.last_y, 2), 
+                        "global_id": e.global_id,
+                        "last_x": round(e.last_x, 2),
+                        "last_y": round(e.last_y, 2),
                         "cameras": sorted(list(e.cam_history)),
                         "zone": e.zone
-                    } for e in self._gallery.values()
+                    } for e in counted
                 ],
                 "zone_counts": zone_counts
             }

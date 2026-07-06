@@ -83,6 +83,13 @@ def _fit_width(img, width):
     return img.resize((width, max(1, round(h * width / w))))
 
 
+def _fit_box(img, max_w, max_h):
+    """Scale to fit inside (max_w, max_h) preserving aspect ratio."""
+    w, h = img.size
+    s = min(max_w / w, max_h / h)
+    return img.resize((max(1, round(w * s)), max(1, round(h * s))))
+
+
 class Visualizer:
     def __init__(self):
         self.cfg = _load_config()
@@ -163,20 +170,24 @@ class Visualizer:
     def _draw_cams(self, height):
         col = Image.new("RGB", (CAM_W, height), BG)
         d = ImageDraw.Draw(col)
+        n = max(1, len(self.cams))
+        # Split the available height into one equal slot per camera so 2, 3 or 4+
+        # feeds all fit without the bottom ones being clipped off-canvas.
+        slot_h = max(60, (height - GAP * (n + 1)) // n)
+        max_w = CAM_W - 2 * GAP
         y = GAP
         for cam in self.cams:
             raw = self.r.get(f"frame:{cam}")
             img = _decode_jpeg(raw) if raw else None
             if img is not None:
-                thumb = _fit_width(img, CAM_W - 2 * GAP)
+                thumb = _fit_box(img, max_w, slot_h)
                 col.paste(thumb, (GAP, y))
                 d.rectangle([GAP, y, GAP + thumb.width, y + thumb.height], outline=(80, 84, 96), width=1)
                 d.text((GAP + 6, y + 4), cam, font=F_LABEL, fill=FG)
-                y += thumb.height + GAP
             else:
-                d.rectangle([GAP, y, CAM_W - GAP, y + 120], outline=(80, 84, 96), width=1)
-                d.text((GAP + 8, y + 50), f"waiting for {cam}...", font=F_SMALL, fill=(150, 150, 160))
-                y += 120 + GAP
+                d.rectangle([GAP, y, CAM_W - GAP, y + slot_h], outline=(80, 84, 96), width=1)
+                d.text((GAP + 8, y + slot_h // 2), f"waiting for {cam}...", font=F_SMALL, fill=(150, 150, 160))
+            y += slot_h + GAP
         return col
 
     # ---- Compose ---------------------------------------------------------
